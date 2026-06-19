@@ -1670,6 +1670,148 @@ def payment_percentage_by_country(overview_df, country_col):
     return grp.sort_values(["Paid Student %", "Paid Students"], ascending=[False, False])
 
 
+def _impact_score_from_activity_mix(total_touchpoints, online_masterclass_count, competition_count, general_fun_count, winner_count):
+    """Community Impact scoring rules, reusable for paid-only and all-student views."""
+    def _int0(v):
+        v = pd.to_numeric(v, errors="coerce")
+        return 0 if pd.isna(v) else int(v)
+
+    n = _int0(total_touchpoints)
+    om = _int0(online_masterclass_count)
+    comp = _int0(competition_count)
+    gen = _int0(general_fun_count)
+    winner_count = _int0(winner_count)
+
+    if n <= 0:
+        score, impact = 0.0, "No Impact"
+    elif n <= 3:
+        score, impact = 0.33, "Low Impact"
+    elif n <= 7:
+        score, impact = 0.66, "Medium Impact"
+    else:
+        score, impact = 1.0, "High Impact"
+
+    non_general_count = max(0, n - gen)
+    three_all_non_general = n == 3 and gen == 0
+    has_non_general = non_general_count >= 1
+
+    # Same Community Impact upgrades, but the caller decides the date/payment scope.
+    if n > 0 and (om >= 5 or comp >= 5):
+        return 1.0, "High Impact"
+    if winner_count >= 1 and non_general_count >= 3:
+        return 1.0, "High Impact"
+    if winner_count >= 2 and non_general_count >= 1:
+        return 1.0, "High Impact"
+    if impact == "Medium Impact" and winner_count > 2:
+        return 1.0, "High Impact"
+    if impact == "Medium Impact" and n in {6, 7} and winner_count >= 1:
+        return 1.0, "High Impact"
+
+    if impact == "Low Impact" and three_all_non_general:
+        return 0.66, "Medium Impact"
+    if impact == "Low Impact" and winner_count >= 1 and has_non_general:
+        return 0.66, "Medium Impact"
+    return score, impact
+
+
+def _all_time_winner_count_for_student(data: dict, row: pd.Series) -> int:
+    """Count all-time Winner/Spotlight records for a student; no payment-date cutoff."""
+    winner_df = data.get("winner_df", pd.DataFrame()) if isinstance(data, dict) else pd.DataFrame()
+    if winner_df is None or winner_df.empty:
+        return 0
+    w = winner_df.copy()
+
+    kind_mask = pd.Series(False, index=w.index)
+    if "is_winner" in w.columns:
+        kind_mask = kind_mask | w["is_winner"].fillna(False).astype(bool)
+    if "is_spotlight" in w.columns:
+        kind_mask = kind_mask | w["is_spotlight"].fillna(False).astype(bool)
+    if kind_mask.any():
+        w = w.loc[kind_mask].copy()
+    if w.empty:
+        return 0
+
+    email = clean_text(row.get("email_key", "")) or clean_text(row.get("Email", ""))
+    student_key = clean_text(row.get("student_key", "")) or normalize_name(row.get("student_name", row.get("Name", "")))
+    mask = pd.Series(False, index=w.index)
+    if email and "email_key" in w.columns:
+        mask = mask | w["email_key"].astype(str).map(clean_text).eq(email)
+    if student_key and "student_key" in w.columns:
+        mask = mask | w["student_key"].astype(str).map(clean_text).eq(student_key)
+    w = w.loc[mask].copy()
+    if w.empty:
+        return 0
+
+    dedupe_cols = [c for c in ["challenge_name", "announcement_date", "entry_type", "email_key", "student_key"] if c in w.columns]
+    if dedupe_cols:
+        return int(w.drop_duplicates(subset=dedupe_cols).shape[0])
+    return int(len(w))
+
+
+def build_overview_all_time_engagement_quality(data: dict) -> pd.DataFrame:
+    """All offered-student engagement quality for Overview.
+
+    Uses the Community Impact scoring logic, but changes the scope exactly for Overview:
+    - all offered students from Master UG + Master PG, not paid-only students;
+    - all-time activity participation from batch + Tetr-X sheets;
+    - all-time Winner/Spotlight records;
+    - no before-payment, first-30-day, or payment-date filter.
+    """
+    overview_df = data.get("overview_df", pd.DataFrame()) if isinstance(data, dict) else pd.DataFrame()
+    if overview_df is None or overview_df.empty:
+        return pd.DataFrame(columns=["student_id", "Name", "Email", "UG/PG", "Batch", "Total Touchpoints (n)", "Event Breakdown", "All-Time Winner", "Impact score", "Impact"])
+
+    rows = []
+    # Deduplicate offered students to prevent repeated master rows from inflating tiers.
+    base = overview_df.copy()
+    base["_overview_student_id"] = base.apply(lambda r: clean_text(r.get("email_key", "")) or clean_text(r.get("student_key", "")) or normalize_name(r.get("student_name", "")), axis=1)
+    base = base[base["_overview_student_id"].astype(str).str.len() > 0].copy()
+    base = base.drop_duplicates(subset=["_overview_student_id"], keep="first")
+
+    for _, r in base.iterrows():
+        email = clean_text(r.get("email_key", ""))
+        student_key = clean_text(r.get("student_key", "")) or normalize_name(r.get("student_name", ""))
+        name = clean_text(r.get("student_name", ""))
+        ev = collect_student_profile_events(data, email, student_key, name)
+
+        counts = {}
+        if ev is not None and not ev.empty:
+            ev2 = ev.copy()
+            if "dedupe_key" in ev2.columns:
+                ev2 = ev2.drop_duplicates(subset=["dedupe_key"]).copy()
+            for typ in ev2.get("event_type", pd.Series(dtype=str)).tolist():
+                bucket = _community_impact_event_bucket(typ)
+                counts[bucket] = int(counts.get(bucket, 0)) + 1
+            n = int(ev2["dedupe_key"].nunique()) if "dedupe_key" in ev2.columns else int(len(ev2))
+        else:
+            n = 0
+
+        winner_count = _all_time_winner_count_for_student(data, r)
+        om = int(counts.get("Online Events & Masterclasses", 0))
+        comp = int(counts.get("Competition", 0))
+        gen = int(counts.get("General/Fun", 0))
+        score, impact = _impact_score_from_activity_mix(n, om, comp, gen, winner_count)
+
+        rows.append({
+            "student_id": clean_text(r.get("_overview_student_id", "")),
+            "Name": name,
+            "Email": email,
+            "UG/PG": clean_text(r.get("Program", "")),
+            "Batch": clean_text(r.get("Batch", "")),
+            "Status": clean_text(r.get("resolved_status", r.get("master_status_value", ""))),
+            "Total Touchpoints (n)": n,
+            "Event Breakdown": _community_impact_event_breakdown_text(counts),
+            "All-Time Winner": winner_count,
+            "_OnlineMasterclass Count": om,
+            "_Competition Count": comp,
+            "_General/Fun Count": gen,
+            "Impact score": score,
+            "Impact": impact,
+        })
+
+    return pd.DataFrame(rows)
+
+
 
 def render_overview(data):
     """Clean Overview v2.
@@ -1682,8 +1824,8 @@ def render_overview(data):
     - Activation: same as Active Students from the parsed master overview data.
       Shows count, % of all offered, and % of acquired/in-community students.
     - Paid Students: Status = Admitted OR status contains Deferral, excluding Refund.
-    - Engagement tiers: same Community Impact categorisation logic, based on
-      `_community_impact_paid_students`.
+    - Engagement tiers: Community Impact categorisation logic applied to all offered
+      students using all-time participation + all-time Winner/Spotlight records.
     """
     st.subheader("Overview")
 
@@ -1757,13 +1899,14 @@ def render_overview(data):
     paid_pct = pct(paid_count, total_students)
     refund_pct = pct(refund_count, total_students)
 
-    # ---------------- Community Impact tiers ----------------
-    # Uses the same categorisation pipeline as Community Impact.
+    # ---------------- Engagement Quality tiers ----------------
+    # Same Community Impact scoring logic, but for Overview it is applied to ALL offered students,
+    # using all-time participation and all-time winners/spotlights. No payment-date filtering.
     try:
-        impact_cohort = _community_impact_paid_students(data)
+        impact_cohort = build_overview_all_time_engagement_quality(data)
     except Exception as e:
         impact_cohort = pd.DataFrame()
-        st.warning(f"Community Impact tier calculation could not be loaded: {e}")
+        st.warning(f"Overview engagement-quality calculation could not be loaded: {e}")
 
     impact_counts = impact_cohort.get("Impact", pd.Series(dtype=str)).value_counts().to_dict() if impact_cohort is not None and not impact_cohort.empty else {}
     high_count = int(impact_counts.get("High Impact", 0))
@@ -1794,7 +1937,7 @@ def render_overview(data):
         f"Deferred students included inside Paid Students: {deferred_count:,}."
     )
 
-    st.markdown("### Engagement Quality — Community Impact Logic")
+    st.markdown("### Engagement Quality — All-Time Participation Logic")
     e1, e2, e3, e4 = st.columns(4)
     e1.metric("High Engaged", f"{high_count:,}")
     e2.metric("Medium Engaged", f"{medium_count:,}")
@@ -1841,7 +1984,7 @@ def render_overview(data):
             "Engagement Tier": ["High", "Medium", "Low", "No Impact"],
             "Students": [high_count, medium_count, low_count, no_impact_count],
         })
-        fig = px.bar(impact_df, x="Engagement Tier", y="Students", text="Students", title="Engagement Tiers from Community Impact")
+        fig = px.bar(impact_df, x="Engagement Tier", y="Students", text="Students", title="Engagement Tiers — All-Time Activity + Winners")
         fig.update_traces(marker_color=GREEN_3, textposition="outside")
         st.plotly_chart(nice_layout(fig, height=360), use_container_width=True, key="overview_v2_impact_tiers")
 
@@ -1870,7 +2013,22 @@ def render_overview(data):
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True, key="overview_v2_program_summary")
 
-    # Optional compact student-level table for audit.
+    # Optional compact student-level tables for audit.
+    with st.expander("Audit table — Engagement Quality source rows", expanded=False):
+        if impact_cohort is not None and not impact_cohort.empty:
+            display_cols = [c for c in [
+                "Name", "Email", "UG/PG", "Batch", "Status", "Total Touchpoints (n)",
+                "Event Breakdown", "All-Time Winner", "Impact score", "Impact"
+            ] if c in impact_cohort.columns]
+            st.dataframe(
+                impact_cohort[display_cols].sort_values(["Impact score", "Total Touchpoints (n)", "Name"], ascending=[False, False, True]),
+                use_container_width=True,
+                height=420,
+                key="overview_v2_engagement_quality_audit_table",
+            )
+        else:
+            st.info("No engagement-quality rows available.")
+
     with st.expander("Audit table — Overview source rows", expanded=False):
         display_cols = [
             c for c in [
