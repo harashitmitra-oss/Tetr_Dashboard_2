@@ -1740,7 +1740,12 @@ def payment_percentage_by_country(overview_df, country_col):
 
 
 def _impact_score_from_activity_mix(total_touchpoints, online_masterclass_count, competition_count, general_fun_count, winner_count):
-    """Community Impact scoring rules, reusable for paid-only and all-student views."""
+    """Overview engagement-quality scoring.
+
+    Participation counts passed into this function should already be scoped by the
+    caller. For the Overview page they are first-30-days touchpoints from the
+    offer date. Winner/Spotlight counts are all-time.
+    """
     def _int0(v):
         v = pd.to_numeric(v, errors="coerce")
         return 0 if pd.isna(v) else int(v)
@@ -1752,8 +1757,8 @@ def _impact_score_from_activity_mix(total_touchpoints, online_masterclass_count,
     winner_count = _int0(winner_count)
 
     if n <= 0:
-        score, impact = 0.0, "No Impact"
-    elif n <= 3:
+        return 0.0, "No Impact"
+    if n <= 3:
         score, impact = 0.33, "Low Impact"
     elif n <= 7:
         score, impact = 0.66, "Medium Impact"
@@ -1763,6 +1768,14 @@ def _impact_score_from_activity_mix(total_touchpoints, online_masterclass_count,
     non_general_count = max(0, n - gen)
     three_all_non_general = n == 3 and gen == 0
     has_non_general = non_general_count >= 1
+
+    # Downgrade rules requested for Overview engagement quality.
+    # These apply only when the student has no Winner/Spotlight record.
+    if winner_count <= 0:
+        if gen >= 4 and gen == n:
+            return 0.33, "Low Impact"
+        if (om + comp) <= 2:
+            return 0.33, "Low Impact"
 
     # Same Community Impact upgrades, but the caller decides the date/payment scope.
     if n > 0 and (om >= 5 or comp >= 5):
@@ -1781,6 +1794,40 @@ def _impact_score_from_activity_mix(total_touchpoints, online_masterclass_count,
     if impact == "Low Impact" and winner_count >= 1 and has_non_general:
         return 0.66, "Medium Impact"
     return score, impact
+
+
+def _overview_engagement_quality_reason(n, om, comp, gen, winner_count):
+    """Human-readable reason for the Overview engagement tier audit table."""
+    def _int0(v):
+        v = pd.to_numeric(v, errors="coerce")
+        return 0 if pd.isna(v) else int(v)
+    n = _int0(n); om = _int0(om); comp = _int0(comp); gen = _int0(gen); winner_count = _int0(winner_count)
+    non_general_count = max(0, n - gen)
+    if n <= 0:
+        return "No first-30-days dated participation"
+    if winner_count <= 0 and gen >= 4 and gen == n:
+        return "Downgraded to Low: 4+ General/Fun only and no Winner/Spotlight"
+    if winner_count <= 0 and (om + comp) <= 2:
+        return "Downgraded to Low: Online/Masterclass + Competition/Hackathon touchpoints <= 2 and no Winner/Spotlight"
+    if n > 0 and (om >= 5 or comp >= 5):
+        return "High: 5+ Online/Masterclass or 5+ Competition/Hackathon touchpoints"
+    if winner_count >= 1 and non_general_count >= 3:
+        return "High: Winner/Spotlight + 3+ non-General/Fun touchpoints"
+    if winner_count >= 2 and non_general_count >= 1:
+        return "High: 2+ Winner/Spotlight + at least 1 non-General/Fun touchpoint"
+    if 4 <= n <= 7 and winner_count > 2:
+        return "High: Medium base + more than 2 Winner/Spotlight records"
+    if 6 <= n <= 7 and winner_count >= 1:
+        return "High: 6-7 touchpoints + Winner/Spotlight"
+    if n == 3 and gen == 0:
+        return "Medium: Low base upgraded because all 3 touchpoints are non-General/Fun"
+    if n <= 3 and winner_count >= 1 and non_general_count >= 1:
+        return "Medium: Low base upgraded by Winner/Spotlight + non-General/Fun touchpoint"
+    if n <= 3:
+        return "Low: 1-3 first-30-days touchpoints"
+    if n <= 7:
+        return "Medium: 4-7 first-30-days touchpoints"
+    return "High: 8+ first-30-days touchpoints"
 
 
 def _all_time_winner_count_for_student(data: dict, row: pd.Series) -> int:
@@ -1817,15 +1864,26 @@ def _all_time_winner_count_for_student(data: dict, row: pd.Series) -> int:
     return int(len(w))
 
 
-def build_overview_all_time_engagement_quality(data: dict) -> pd.DataFrame:
-    """All offered-student engagement quality for Overview.
+def build_overview_first30_engagement_quality(data: dict) -> pd.DataFrame:
+    """Offered-student engagement quality for Overview using the first 30 days.
 
-    Fast version: uses the prebuilt all-time activity + winner indexes, so Overview
-    no longer rescans every event sheet once per student.
+    Scope:
+    - Students: all offered students from Master UG / Master PG.
+    - Participation: unique dated activity touchpoints in the first 30 days from
+      Offered Date using the Dates sheet. If Deadline is present, it is used as
+      the end of the first-30-days window; otherwise Offered Date + 30 days is used.
+    - Winners/Spotlight: counted all-time.
     """
     overview_df = data.get("overview_df", pd.DataFrame()) if isinstance(data, dict) else pd.DataFrame()
+    empty_cols = [
+        "student_id", "Name", "Email", "UG/PG", "Batch", "Status",
+        "Offered Date", "First 30 Days End", "First 30d Window",
+        "Total Touchpoints (n)", "Event Breakdown", "All-Time Winner",
+        "_OnlineMasterclass Count", "_Competition Count", "_General/Fun Count",
+        "Impact score", "Impact", "Engagement Rule Applied"
+    ]
     if overview_df is None or overview_df.empty:
-        return pd.DataFrame(columns=["student_id", "Name", "Email", "UG/PG", "Batch", "Total Touchpoints (n)", "Event Breakdown", "All-Time Winner", "Impact score", "Impact"])
+        return pd.DataFrame(columns=empty_cols)
 
     base = overview_df.copy()
     base["_overview_student_id"] = base.apply(
@@ -1838,38 +1896,69 @@ def build_overview_all_time_engagement_quality(data: dict) -> pd.DataFrame:
     activity_index = data.get("all_time_student_activity_index", pd.DataFrame()) if isinstance(data, dict) else pd.DataFrame()
     winner_counts = data.get("winner_count_index", {}) if isinstance(data, dict) else {}
 
-    # Per-student all-time event buckets.
     if activity_index is not None and not activity_index.empty:
-        activity_index = activity_index.drop_duplicates(subset=["dedupe_key"]).copy()
-        pivot = (
-            activity_index.groupby(["student_id", "event_bucket"]).size()
-            .unstack(fill_value=0)
-            .rename_axis(None, axis=1)
+        aidx = activity_index.copy()
+        aidx["event_date"] = pd.to_datetime(aidx.get("event_date", pd.NaT), errors="coerce").dt.normalize()
+        aidx["event_identity_key"] = (
+            aidx.get("event_name", pd.Series("", index=aidx.index)).astype(str).map(normalize_name)
+            + "|" + aidx.get("event_type", pd.Series("", index=aidx.index)).astype(str).map(normalize_name)
+            + "|" + aidx["event_date"].dt.strftime("%Y-%m-%d").fillna("undated")
         )
-        total_touchpoints = activity_index.groupby("student_id")["dedupe_key"].nunique().to_dict()
+        if "event_bucket" not in aidx.columns:
+            aidx["event_bucket"] = aidx.get("event_type", pd.Series("", index=aidx.index)).map(_community_impact_event_bucket)
+
+        # Pre-index by every stable student identifier so email/name mismatches do not lose activity.
+        key_to_indices = {}
+        for idx, ar in aidx.iterrows():
+            keys = {
+                clean_text(ar.get("student_id", "")),
+                clean_text(ar.get("email_key", "")),
+                clean_text(ar.get("student_key", "")),
+                normalize_name(ar.get("student_name", "")),
+            }
+            for key in [k for k in keys if k]:
+                key_to_indices.setdefault(key, []).append(idx)
     else:
-        pivot = pd.DataFrame()
-        total_touchpoints = {}
+        aidx = pd.DataFrame()
+        key_to_indices = {}
 
     rows = []
     for _, r in base.iterrows():
         sid = clean_text(r.get("_overview_student_id", ""))
         email = clean_text(r.get("email_key", ""))
         student_key = clean_text(r.get("student_key", "")) or normalize_name(r.get("student_name", ""))
+        name_key = normalize_name(r.get("student_name", ""))
+
+        offered_dt = pd.to_datetime(r.get("offered_date_parsed", pd.NaT), errors="coerce")
+        deadline_dt = pd.to_datetime(r.get("deadline_parsed", pd.NaT), errors="coerce")
+        first30_end = pd.NaT
+        window_label = "Missing Offered Date"
+        if pd.notna(offered_dt):
+            offered_dt = offered_dt.normalize()
+            first30_end = deadline_dt.normalize() if pd.notna(deadline_dt) else offered_dt + pd.Timedelta(days=30)
+            window_label = f"{offered_dt.strftime('%d-%b-%Y')} to {first30_end.strftime('%d-%b-%Y')}"
 
         counts = {}
-        if not pivot.empty and sid in pivot.index:
-            prow = pivot.loc[sid]
-            for bucket in ["Online Events & Masterclasses", "Competition", "General/Fun", "Other"]:
-                if bucket in prow.index:
-                    counts[bucket] = int(prow.get(bucket, 0))
+        n = 0
+        if not aidx.empty and pd.notna(offered_dt):
+            match_indices = set()
+            for key in [sid, email, student_key, name_key]:
+                if key and key in key_to_indices:
+                    match_indices.update(key_to_indices[key])
+            if match_indices:
+                ev = aidx.loc[list(match_indices)].copy()
+                ev = ev[ev["event_date"].notna() & ev["event_date"].between(offered_dt, first30_end, inclusive="both")].copy()
+                if not ev.empty:
+                    ev = ev.drop_duplicates(subset=["event_identity_key"]).copy()
+                    counts = ev["event_bucket"].value_counts().astype(int).to_dict()
+                    n = int(len(ev))
 
-        n = int(total_touchpoints.get(sid, 0))
-        winner_count = int(max(winner_counts.get(email, 0), winner_counts.get(student_key, 0), winner_counts.get(sid, 0)))
+        winner_count = int(max(winner_counts.get(email, 0), winner_counts.get(student_key, 0), winner_counts.get(sid, 0), winner_counts.get(name_key, 0)))
         om = int(counts.get("Online Events & Masterclasses", 0))
         comp = int(counts.get("Competition", 0))
         gen = int(counts.get("General/Fun", 0))
         score, impact = _impact_score_from_activity_mix(n, om, comp, gen, winner_count)
+        reason = _overview_engagement_quality_reason(n, om, comp, gen, winner_count)
 
         rows.append({
             "student_id": sid,
@@ -1878,6 +1967,9 @@ def build_overview_all_time_engagement_quality(data: dict) -> pd.DataFrame:
             "UG/PG": clean_text(r.get("Program", "")),
             "Batch": clean_text(r.get("Batch", "")),
             "Status": clean_text(r.get("resolved_status", r.get("master_status_value", ""))),
+            "Offered Date": offered_dt,
+            "First 30 Days End": first30_end,
+            "First 30d Window": window_label,
             "Total Touchpoints (n)": n,
             "Event Breakdown": _community_impact_event_breakdown_text(counts),
             "All-Time Winner": winner_count,
@@ -1886,9 +1978,15 @@ def build_overview_all_time_engagement_quality(data: dict) -> pd.DataFrame:
             "_General/Fun Count": gen,
             "Impact score": score,
             "Impact": impact,
+            "Engagement Rule Applied": reason,
         })
 
     return pd.DataFrame(rows)
+
+
+def build_overview_all_time_engagement_quality(data: dict) -> pd.DataFrame:
+    """Compatibility wrapper: Overview now uses first-30-days engagement quality."""
+    return build_overview_first30_engagement_quality(data)
 
 
 
@@ -1990,7 +2088,7 @@ def render_overview(data):
       Shows count, % of all offered, and % of acquired/in-community students.
     - Paid Students: Status = Admitted OR status contains Deferral, excluding Refund.
     - Engagement tiers: Community Impact categorisation logic applied to all offered
-      students using all-time participation + all-time Winner/Spotlight records.
+      students using first-30-days participation from Offered Date + all-time Winner/Spotlight records.
     """
     st.subheader("Overview")
 
@@ -2072,9 +2170,10 @@ def render_overview(data):
 
     # ---------------- Engagement Quality tiers ----------------
     # Same Community Impact scoring logic, but for Overview it is applied to ALL offered students,
-    # using all-time participation and all-time winners/spotlights. No payment-date filtering.
+    # using first-30-days participation from Offered Date and all-time winners/spotlights.
+    # No payment-date or pre-payment filter is applied.
     try:
-        impact_cohort = build_overview_all_time_engagement_quality(data)
+        impact_cohort = build_overview_first30_engagement_quality(data)
     except Exception as e:
         impact_cohort = pd.DataFrame()
         st.warning(f"Overview engagement-quality calculation could not be loaded: {e}")
@@ -2169,17 +2268,38 @@ def render_overview(data):
         f"Deferred students included inside Paid Students: {deferred_count:,}."
     )
 
-    st.markdown("### Engagement Quality — All-Time Participation Logic")
+    st.markdown("### Engagement Quality — First 30 Days Participation Logic")
     st.caption(
-        "Logic: count all-time unique participation touchpoints across Master/Batch/Tetr-X activity columns plus all-time Winner/Spotlight records. "
-        "No payment-date or pre-payment filter is applied in Overview."
+        "Logic: count unique dated participation touchpoints within each student's first 30 days from Offered Date using the Dates sheet. "
+        "Deadline is used as the first-30-days end date when available; otherwise Offered Date + 30 days is used. "
+        "Winner/Spotlight records are counted all-time. No payment-date or pre-payment filter is applied."
     )
     with st.expander("View Engagement Quality division logic", expanded=False):
         logic_df = pd.DataFrame([
-            {"Tier": "No Engagement", "Base rule": "0 all-time touchpoints", "Upgrade rules": "No upgrades"},
-            {"Tier": "Low Engaged", "Base rule": "1–3 all-time touchpoints", "Upgrade rules": "Can upgrade to Medium if all 3 are non-General/Fun, or if Winner/Spotlight + at least 1 non-General/Fun"},
-            {"Tier": "Medium Engaged", "Base rule": "4–7 all-time touchpoints", "Upgrade rules": "Can upgrade to High if 6–7 touchpoints + Winner/Spotlight, or more than 2 Winner/Spotlight records"},
-            {"Tier": "High Engaged", "Base rule": "8+ all-time touchpoints", "Upgrade rules": "Also High if Online Events/Masterclasses ≥5, Competitions/Hackathons ≥5, Winner/Spotlight + 3+ non-General/Fun, or 2+ Winner/Spotlight + 1+ non-General/Fun"},
+            {
+                "Tier": "No Engagement",
+                "Base rule": "0 first-30-days dated touchpoints",
+                "Upgrade rules": "No upgrades",
+                "Downgrade rules": "Not applicable",
+            },
+            {
+                "Tier": "Low Engaged",
+                "Base rule": "1–3 first-30-days dated touchpoints",
+                "Upgrade rules": "Can upgrade to Medium if all 3 are non-General/Fun, or if all-time Winner/Spotlight + at least 1 non-General/Fun",
+                "Downgrade rules": "Already Low",
+            },
+            {
+                "Tier": "Medium Engaged",
+                "Base rule": "4–7 first-30-days dated touchpoints",
+                "Upgrade rules": "Can upgrade to High if 6–7 touchpoints + all-time Winner/Spotlight, or more than 2 all-time Winner/Spotlight records",
+                "Downgrade rules": "Downgrade to Low if no all-time Winner/Spotlight and either 4+ General/Fun only, or Online/Masterclass + Competition/Hackathon touchpoints <= 2",
+            },
+            {
+                "Tier": "High Engaged",
+                "Base rule": "8+ first-30-days dated touchpoints",
+                "Upgrade rules": "Also High if Online Events/Masterclasses ≥5, Competitions/Hackathons ≥5, all-time Winner/Spotlight + 3+ non-General/Fun, or 2+ all-time Winner/Spotlight + 1+ non-General/Fun",
+                "Downgrade rules": "Downgrade to Low if no all-time Winner/Spotlight and either 4+ General/Fun only, or Online/Masterclass + Competition/Hackathon touchpoints <= 2",
+            },
         ])
         st.dataframe(logic_df, use_container_width=True, hide_index=True, key="overview_v2_engagement_logic_table")
 
@@ -2198,7 +2318,7 @@ def render_overview(data):
     def _out_community_delta_for_tier(tier):
         paid = int(tier_out_community_paid_counts.get(tier, 0))
         total = int(tier_out_community_counts.get(tier, 0))
-        return f"{paid:,} paid/admitted · {pct(paid, total):.1f}% paid"
+        return f"{paid:,} paid/admitted · {pct(paid, total):.1f}% of out-community"
 
     oc1, oc2, oc3, oc4 = st.columns(4)
     oc1.metric("No Engagement Out Community", f"{tier_out_community_counts.get('No Engagement', 0):,}", delta=_out_community_delta_for_tier("No Engagement"))
@@ -2214,7 +2334,7 @@ def render_overview(data):
             "Paid %": f"{pct(tier_paid_counts.get(tier, 0), tier_total_counts.get(tier, 0)):.1f}%",
             "Out Community": int(tier_out_community_counts.get(tier, 0)),
             "Out Community Paid": int(tier_out_community_paid_counts.get(tier, 0)),
-            "Out Community Paid %": f"{pct(tier_out_community_paid_counts.get(tier, 0), tier_out_community_counts.get(tier, 0)):.1f}%",
+            "Out Community Paid % (of Out Community)": f"{pct(tier_out_community_paid_counts.get(tier, 0), tier_out_community_counts.get(tier, 0)):.1f}%",
         }
         for tier in engagement_tier_order
     ])
@@ -2321,8 +2441,8 @@ def render_overview(data):
             if "In Community" in audit_df.columns:
                 audit_df["In Community"] = audit_df["In Community"].map(lambda x: "Yes" if bool(x) else "No")
             display_cols = [c for c in [
-                "Name", "Email", "UG/PG", "Batch", "Status", "Paid / Admitted", "In Community", "Community Segment", "Total Touchpoints (n)",
-                "Event Breakdown", "All-Time Winner", "Engagement score", "Engagement Quality"
+                "Name", "Email", "UG/PG", "Batch", "Status", "Paid / Admitted", "In Community", "Community Segment", "Offered Date", "First 30 Days End", "First 30d Window", "Total Touchpoints (n)",
+                "Event Breakdown", "All-Time Winner", "Engagement Rule Applied", "Engagement score", "Engagement Quality"
             ] if c in audit_df.columns]
             st.dataframe(
                 audit_df[display_cols].sort_values(["Engagement score", "Total Touchpoints (n)", "Name"], ascending=[False, False, True]),
