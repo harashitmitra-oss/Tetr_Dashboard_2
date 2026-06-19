@@ -2085,13 +2085,16 @@ def render_overview(data):
     low_count = int(impact_counts.get("Low Impact", 0))
     no_impact_count = int(impact_counts.get("No Impact", 0))
 
-    # Paid/admitted split inside each Engagement Quality tier.
+    # Paid/admitted + community split inside each Engagement Quality tier.
     # This is Overview-only and does not change the engagement-quality scoring itself.
     paid_by_student_id = {}
+    community_by_student_id = {}
     for idx, r in overview_df.iterrows():
         sid = clean_text(r.get("email_key", "")) or clean_text(r.get("student_key", "")) or normalize_name(r.get("student_name", ""))
         if sid and sid not in paid_by_student_id:
             paid_by_student_id[sid] = bool(paid_mask.loc[idx]) if idx in paid_mask.index else False
+        if sid and sid not in community_by_student_id:
+            community_by_student_id[sid] = bool(community_mask.loc[idx]) if idx in community_mask.index else False
 
     tier_label_map = {
         "High Impact": "High Engaged",
@@ -2100,7 +2103,10 @@ def render_overview(data):
         "No Impact": "No Engagement",
     }
     engagement_tier_order = ["High Engaged", "Medium Engaged", "Low Engaged", "No Engagement"]
+    out_community_tier_order = ["No Engagement", "Low Engaged", "Medium Engaged", "High Engaged"]
     tier_paid_counts = {tier: 0 for tier in engagement_tier_order}
+    tier_out_community_counts = {tier: 0 for tier in engagement_tier_order}
+    tier_out_community_paid_counts = {tier: 0 for tier in engagement_tier_order}
     tier_total_counts = {
         "High Engaged": high_count,
         "Medium Engaged": medium_count,
@@ -2112,8 +2118,27 @@ def render_overview(data):
         impact_cohort = impact_cohort.copy()
         impact_cohort["Engagement Tier"] = impact_cohort.get("Impact", pd.Series("", index=impact_cohort.index)).map(tier_label_map).fillna(impact_cohort.get("Impact", ""))
         impact_cohort["Paid / Admitted"] = impact_cohort.get("student_id", pd.Series("", index=impact_cohort.index)).map(paid_by_student_id).fillna(False).astype(bool)
+        impact_cohort["In Community"] = impact_cohort.get("student_id", pd.Series("", index=impact_cohort.index)).map(community_by_student_id).fillna(False).astype(bool)
+        impact_cohort["Community Segment"] = np.where(impact_cohort["In Community"], "In Community", "Out Community")
+
         tier_paid_counts.update(
             impact_cohort[impact_cohort["Paid / Admitted"]]
+            .groupby("Engagement Tier")
+            .size()
+            .reindex(engagement_tier_order, fill_value=0)
+            .astype(int)
+            .to_dict()
+        )
+        tier_out_community_counts.update(
+            impact_cohort[~impact_cohort["In Community"]]
+            .groupby("Engagement Tier")
+            .size()
+            .reindex(engagement_tier_order, fill_value=0)
+            .astype(int)
+            .to_dict()
+        )
+        tier_out_community_paid_counts.update(
+            impact_cohort[(~impact_cohort["In Community"]) & impact_cohort["Paid / Admitted"]]
             .groupby("Engagement Tier")
             .size()
             .reindex(engagement_tier_order, fill_value=0)
@@ -2145,11 +2170,55 @@ def render_overview(data):
     )
 
     st.markdown("### Engagement Quality — All-Time Participation Logic")
+    st.caption(
+        "Logic: count all-time unique participation touchpoints across Master/Batch/Tetr-X activity columns plus all-time Winner/Spotlight records. "
+        "No payment-date or pre-payment filter is applied in Overview."
+    )
+    with st.expander("View Engagement Quality division logic", expanded=False):
+        logic_df = pd.DataFrame([
+            {"Tier": "No Engagement", "Base rule": "0 all-time touchpoints", "Upgrade rules": "No upgrades"},
+            {"Tier": "Low Engaged", "Base rule": "1–3 all-time touchpoints", "Upgrade rules": "Can upgrade to Medium if all 3 are non-General/Fun, or if Winner/Spotlight + at least 1 non-General/Fun"},
+            {"Tier": "Medium Engaged", "Base rule": "4–7 all-time touchpoints", "Upgrade rules": "Can upgrade to High if 6–7 touchpoints + Winner/Spotlight, or more than 2 Winner/Spotlight records"},
+            {"Tier": "High Engaged", "Base rule": "8+ all-time touchpoints", "Upgrade rules": "Also High if Online Events/Masterclasses ≥5, Competitions/Hackathons ≥5, Winner/Spotlight + 3+ non-General/Fun, or 2+ Winner/Spotlight + 1+ non-General/Fun"},
+        ])
+        st.dataframe(logic_df, use_container_width=True, hide_index=True, key="overview_v2_engagement_logic_table")
+
+    def _paid_delta_for_tier(tier):
+        paid = int(tier_paid_counts.get(tier, 0))
+        total = int(tier_total_counts.get(tier, 0))
+        return f"{paid:,} paid/admitted · {pct(paid, total):.1f}% paid"
+
     e1, e2, e3, e4 = st.columns(4)
-    e1.metric("High Engaged", f"{high_count:,}", delta=f"{tier_paid_counts.get('High Engaged', 0):,} paid/admitted")
-    e2.metric("Medium Engaged", f"{medium_count:,}", delta=f"{tier_paid_counts.get('Medium Engaged', 0):,} paid/admitted")
-    e3.metric("Low Engaged", f"{low_count:,}", delta=f"{tier_paid_counts.get('Low Engaged', 0):,} paid/admitted")
-    e4.metric("No Engagement", f"{no_impact_count:,}", delta=f"{tier_paid_counts.get('No Engagement', 0):,} paid/admitted")
+    e1.metric("High Engaged", f"{high_count:,}", delta=_paid_delta_for_tier("High Engaged"))
+    e2.metric("Medium Engaged", f"{medium_count:,}", delta=_paid_delta_for_tier("Medium Engaged"))
+    e3.metric("Low Engaged", f"{low_count:,}", delta=_paid_delta_for_tier("Low Engaged"))
+    e4.metric("No Engagement", f"{no_impact_count:,}", delta=_paid_delta_for_tier("No Engagement"))
+
+    st.markdown("#### Engagement Quality — Out Community Split")
+    def _out_community_delta_for_tier(tier):
+        paid = int(tier_out_community_paid_counts.get(tier, 0))
+        total = int(tier_out_community_counts.get(tier, 0))
+        return f"{paid:,} paid/admitted · {pct(paid, total):.1f}% paid"
+
+    oc1, oc2, oc3, oc4 = st.columns(4)
+    oc1.metric("No Engagement Out Community", f"{tier_out_community_counts.get('No Engagement', 0):,}", delta=_out_community_delta_for_tier("No Engagement"))
+    oc2.metric("Low Engagement Out Community", f"{tier_out_community_counts.get('Low Engaged', 0):,}", delta=_out_community_delta_for_tier("Low Engaged"))
+    oc3.metric("Medium Engagement Out Community", f"{tier_out_community_counts.get('Medium Engaged', 0):,}", delta=_out_community_delta_for_tier("Medium Engaged"))
+    oc4.metric("High Engagement Out Community", f"{tier_out_community_counts.get('High Engaged', 0):,}", delta=_out_community_delta_for_tier("High Engaged"))
+
+    engagement_summary_df = pd.DataFrame([
+        {
+            "Engagement Tier": tier,
+            "Total Students": int(tier_total_counts.get(tier, 0)),
+            "Paid / Admitted": int(tier_paid_counts.get(tier, 0)),
+            "Paid %": f"{pct(tier_paid_counts.get(tier, 0), tier_total_counts.get(tier, 0)):.1f}%",
+            "Out Community": int(tier_out_community_counts.get(tier, 0)),
+            "Out Community Paid": int(tier_out_community_paid_counts.get(tier, 0)),
+            "Out Community Paid %": f"{pct(tier_out_community_paid_counts.get(tier, 0), tier_out_community_counts.get(tier, 0)):.1f}%",
+        }
+        for tier in engagement_tier_order
+    ])
+    st.dataframe(engagement_summary_df, use_container_width=True, hide_index=True, key="overview_v2_engagement_quality_summary")
 
     # ---------------- Clean visuals ----------------
     v1, v2, v3 = st.columns([1, 1, 1])
@@ -2186,29 +2255,33 @@ def render_overview(data):
         fig.update_traces(marker_color=GREEN_2, textposition="outside")
         st.plotly_chart(nice_layout(fig, height=360), use_container_width=True, key="overview_v2_payment_status")
     with v5:
-        impact_df = pd.DataFrame([
-            {
-                "Engagement Tier": tier,
-                "Student Type": "Paid / Admitted",
-                "Students": int(tier_paid_counts.get(tier, 0)),
-            }
-            for tier in engagement_tier_order
-        ] + [
-            {
-                "Engagement Tier": tier,
-                "Student Type": "Not Paid / Refund",
-                "Students": max(int(tier_total_counts.get(tier, 0)) - int(tier_paid_counts.get(tier, 0)), 0),
-            }
-            for tier in engagement_tier_order
-        ])
+        if impact_cohort is not None and not impact_cohort.empty:
+            impact_df = (
+                impact_cohort.assign(
+                    **{
+                        "Paid Segment": np.where(impact_cohort["Paid / Admitted"], "Paid / Admitted", "Not Paid / Refund"),
+                        "Student Segment": np.where(
+                            impact_cohort["Paid / Admitted"],
+                            np.where(impact_cohort["In Community"], "Paid · In Community", "Paid · Out Community"),
+                            np.where(impact_cohort["In Community"], "Not Paid · In Community", "Not Paid · Out Community"),
+                        ),
+                    }
+                )
+                .groupby(["Engagement Tier", "Student Segment"], as_index=False)
+                .size()
+                .rename(columns={"size": "Students"})
+            )
+        else:
+            impact_df = pd.DataFrame(columns=["Engagement Tier", "Student Segment", "Students"])
+        segment_order = ["Paid · In Community", "Paid · Out Community", "Not Paid · In Community", "Not Paid · Out Community"]
         fig = px.bar(
             impact_df,
             x="Engagement Tier",
             y="Students",
-            color="Student Type",
+            color="Student Segment",
             text="Students",
-            title="Engagement Quality — Paid/Admitted Split",
-            category_orders={"Engagement Tier": engagement_tier_order, "Student Type": ["Paid / Admitted", "Not Paid / Refund"]},
+            title="Engagement Quality — Paid and Community Split",
+            category_orders={"Engagement Tier": engagement_tier_order, "Student Segment": segment_order},
         )
         fig.update_traces(textposition="inside")
         st.plotly_chart(nice_layout(fig, height=360), use_container_width=True, key="overview_v2_impact_tiers")
@@ -2245,8 +2318,10 @@ def render_overview(data):
             audit_df["Engagement Quality"] = audit_df["Engagement Quality"].replace({"High Impact": "High Engaged", "Medium Impact": "Medium Engaged", "Low Impact": "Low Engaged", "No Impact": "No Engagement"})
             if "Paid / Admitted" in audit_df.columns:
                 audit_df["Paid / Admitted"] = audit_df["Paid / Admitted"].map(lambda x: "Yes" if bool(x) else "No")
+            if "In Community" in audit_df.columns:
+                audit_df["In Community"] = audit_df["In Community"].map(lambda x: "Yes" if bool(x) else "No")
             display_cols = [c for c in [
-                "Name", "Email", "UG/PG", "Batch", "Status", "Paid / Admitted", "Total Touchpoints (n)",
+                "Name", "Email", "UG/PG", "Batch", "Status", "Paid / Admitted", "In Community", "Community Segment", "Total Touchpoints (n)",
                 "Event Breakdown", "All-Time Winner", "Engagement score", "Engagement Quality"
             ] if c in audit_df.columns]
             st.dataframe(
