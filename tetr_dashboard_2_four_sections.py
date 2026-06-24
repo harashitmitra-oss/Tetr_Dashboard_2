@@ -8801,6 +8801,17 @@ def render_community_impact_page(data):
 
 # ---------------- ML Predictions ----------------
 
+def _ml_progress(progress_callback, pct: int, message: str):
+    """Safely update the ML loading progress UI without affecting cached/headless runs."""
+    if not callable(progress_callback):
+        return
+    try:
+        pct = int(max(0, min(100, pct)))
+        progress_callback(pct, clean_text(message))
+    except Exception:
+        # Progress UI must never break model building.
+        pass
+
 def _ml_event_group(event_name: str, event_type: str = "") -> str:
     """Repeatable speaker/topic/challenge grouping for ML conversion intelligence.
 
@@ -9030,9 +9041,10 @@ def _ml_student_reason(row: pd.Series) -> str:
     first_day = int(row.get("first_activity_day", 999) or 999)
 
     if total > 0:
-        reasons.append(f"{total} pre-payment touchpoints across {active_days} active day{'s' if active_days != 1 else ''}")
+        scope = clean_text(row.get("Observation Scope", "observed window")) or "observed window"
+        reasons.append(f"{total} touchpoints in {scope.lower()} across {active_days} active day{'s' if active_days != 1 else ''}")
     else:
-        reasons.append("no pre-payment activity in the observation window")
+        reasons.append("no activity in the observed window")
     if first_day != 999:
         reasons.append(f"first activated on day {first_day + 1} from offer")
     if om:
@@ -9043,6 +9055,14 @@ def _ml_student_reason(row: pd.Series) -> str:
         reasons.append(f"{gen} general/fun-only touchpoint{'s' if gen != 1 else ''}")
     if winner > 0:
         reasons.append(f"{winner} winner/spotlight signal{'s' if winner != 1 else ''}")
+    if int(row.get("reactivated_after_deadline", 0) or 0) > 0:
+        gap = int(row.get("reactivation_gap_days", 999) or 999)
+        pd_tp = int(row.get("post_deadline_touchpoints", 0) or 0)
+        pd_meaningful = int(row.get("post_deadline_meaningful_touchpoints", 0) or 0)
+        if gap != 999:
+            reasons.append(f"reactivated {gap} day{'s' if gap != 1 else ''} after deadline with {pd_tp} late touchpoint{'s' if pd_tp != 1 else ''}")
+        if pd_meaningful > 0:
+            reasons.append(f"{pd_meaningful} meaningful post-deadline touchpoint{'s' if pd_meaningful != 1 else ''}")
 
     group_map = _ml_event_group_feature_map()
     hit_groups = []
@@ -9069,6 +9089,8 @@ def _ml_recommended_actions(row: pd.Series) -> str:
     gen = int(row.get("general_fun_count", 0) or 0)
     prob = float(row.get("Payment Probability", 0) or 0)
 
+    if int(row.get("reactivated_after_deadline", 0) or 0) > 0:
+        actions.append("prioritize fast counsellor follow-up: student reactivated after deadline")
     if not bool(row.get("community_acquired", False)):
         actions.append("move into community / WA flow first")
     if total == 0:
@@ -9079,6 +9101,8 @@ def _ml_recommended_actions(row: pd.Series) -> str:
         actions.append("invite to a repeatable challenge/hackathon to create commitment")
     if gen > 0 and om == 0 and comp == 0:
         actions.append("upgrade from general/fun activity to meaningful event participation")
+    if int(row.get("active_after_deadline_only", 0) or 0) > 0:
+        actions.append("use late-interest context: share payment clarity and next available batch path")
     if int(row.get("group_count_welcome_webinar", 0) or 0) == 0:
         actions.append("send Welcome Webinar recording/invite")
     if int(row.get("group_count_life_at_tetr", 0) or 0) == 0:
@@ -9215,13 +9239,16 @@ def _ml_winner_count_until(data: dict, email: str, student_key: str, student_nam
     return int(w.drop_duplicates(subset=[c for c in ["challenge_name", "announcement_date", "entry_type"] if c in w.columns]).shape[0])
 
 
-def build_ml_prediction_dataset(data: dict):
-    """Build payment-prediction features from pre-payment behavior only.
+def build_ml_prediction_dataset(data: dict, progress_callback=None):
+    """Build payment-prediction features with payment-safe observation windows.
 
-    Paid rows use activities before payment date. Unpaid rows use the first 30 days
-    from offer/deadline. Refund rows are included as converted because they paid at
-    least once; refund risk will be modeled separately later.
+    Converted rows use activities before payment date only. Unpaid rows use all
+    currently recorded participation because they have no payment date yet. This
+    also captures post-deadline reactivation after the standard 30-day journey.
+    Refund rows are included as converted because they paid at least once; refund
+    risk will be modeled separately later.
     """
+    _ml_progress(progress_callback, 3, "Preparing offered-student base from Master UG/PG...")
     overview_df = data.get("overview_df", pd.DataFrame()) if isinstance(data, dict) else pd.DataFrame()
     if overview_df is None or overview_df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -9234,6 +9261,7 @@ def build_ml_prediction_dataset(data: dict):
     country_col = best_matching_col(base, ["country"])
     income_col = best_matching_col(base, ["income"])
     course_col = best_matching_col(base, ["course"])
+    _ml_progress(progress_callback, 8, "Resolving student attributes, community status, and payment labels...")
     attr_lookup = _ml_attr_lookup_from_activities(data)
     payment_lookup = _ml_tetrx_payment_lookup(data)
 
@@ -9272,6 +9300,7 @@ def build_ml_prediction_dataset(data: dict):
             }
             for k in [x for x in keys if x]:
                 key_to_indices.setdefault(k, []).append(idx)
+        _ml_progress(progress_callback, 22, f"Indexed {len(aidx):,} activity rows across all sheets.")
     else:
         aidx = pd.DataFrame()
         key_to_indices = {}
@@ -9280,7 +9309,14 @@ def build_ml_prediction_dataset(data: dict):
     event_rows = []
     fixed_groups = _ml_event_group_feature_map()
 
-    for idx, r in base.iterrows():
+    total_base_rows = int(len(base))
+    progress_step = max(1, total_base_rows // 20) if total_base_rows else 1
+    _ml_progress(progress_callback, 24, f"Building payment-safe features for {total_base_rows:,} offered students...")
+
+    for pos, (idx, r) in enumerate(base.iterrows(), start=1):
+        if pos == 1 or pos == total_base_rows or pos % progress_step == 0:
+            pct = 24 + int(31 * (pos / max(total_base_rows, 1)))
+            _ml_progress(progress_callback, pct, f"Building payment-safe feature set and reactivation signals... {pos:,}/{total_base_rows:,} students processed")
         sid = clean_text(r.get("student_id", ""))
         email = clean_text(r.get("email_key", ""))
         skey = clean_text(r.get("student_key", "")) or normalize_name(r.get("student_name", ""))
@@ -9303,12 +9339,21 @@ def build_ml_prediction_dataset(data: dict):
         if pd.notna(offered_dt):
             first30_end = deadline_dt if pd.notna(deadline_dt) else offered_dt + pd.Timedelta(days=30)
         cutoff_dt = pd.NaT
+        observation_scope = "Unpaid · all recorded activity"
         if is_paid and pd.notna(payment_dt):
+            # Converted students must remain payment-safe: use only behavior before payment.
+            # Do NOT cap at the first 30 days because late reactivation before payment is a real conversion signal.
             cutoff_dt = payment_dt - pd.Timedelta(days=1)
-            if pd.notna(first30_end):
-                cutoff_dt = min(cutoff_dt, first30_end)
-        elif pd.notna(first30_end):
+            observation_scope = "Converted · before payment"
+        elif is_paid:
+            # Converted but missing payment date: safest fallback is the first 30-day journey.
             cutoff_dt = first30_end
+            observation_scope = "Converted · first 30 days fallback"
+        else:
+            # Unpaid students have no payment date, so use all recorded participation so far.
+            # This captures reactivation after deadline / after the 30-day journey.
+            cutoff_dt = pd.NaT
+            observation_scope = "Unpaid · all recorded activity"
 
         match_indices = set()
         for k in [sid, email, skey, normalize_name(name)]:
@@ -9320,8 +9365,6 @@ def build_ml_prediction_dataset(data: dict):
             ev = ev[ev["event_date"].notna()].copy()
             if pd.notna(offered_dt):
                 ev = ev[ev["event_date"].ge(offered_dt)].copy()
-            elif not is_paid:
-                ev = ev.iloc[0:0].copy()
             if pd.notna(cutoff_dt):
                 ev = ev[ev["event_date"].le(cutoff_dt)].copy()
             if is_paid and pd.notna(payment_dt):
@@ -9346,6 +9389,38 @@ def build_ml_prediction_dataset(data: dict):
             first_activity_day = 999
             last_activity_day = 999
             week1 = week2 = week3 = week4 = 0
+
+        # First-30-day journey and late reactivation signals. These are important because
+        # Tetr runs a structured offer-to-deadline journey and then continues nurture
+        # communications after deadline for students who may still convert later.
+        first30_touchpoints = 0
+        first30_active_days = 0
+        post_deadline_touchpoints = 0
+        post_deadline_active_days = 0
+        reactivated_after_deadline = 0
+        reactivation_gap_days = 999
+        last_post_deadline_activity_day = 999
+        post_deadline_bucket_counts = {}
+        if not ev.empty and "event_date" in ev.columns:
+            ev_dates_norm = pd.to_datetime(ev["event_date"], errors="coerce").dt.normalize()
+            if pd.notna(first30_end):
+                first30_mask = ev_dates_norm.le(first30_end)
+                first30_ev = ev.loc[first30_mask].copy()
+                first30_touchpoints = int(len(first30_ev))
+                first30_active_days = int(ev_dates_norm.loc[first30_mask].dropna().nunique())
+            if pd.notna(deadline_dt):
+                post_deadline_mask = ev_dates_norm.gt(deadline_dt)
+                post_deadline_ev = ev.loc[post_deadline_mask].copy()
+                post_deadline_touchpoints = int(len(post_deadline_ev))
+                post_deadline_active_days = int(ev_dates_norm.loc[post_deadline_mask].dropna().nunique())
+                if post_deadline_touchpoints > 0:
+                    reactivated_after_deadline = 1
+                    days_after_deadline = (ev_dates_norm.loc[post_deadline_mask].dropna() - deadline_dt).dt.days
+                    if not days_after_deadline.empty:
+                        reactivation_gap_days = int(days_after_deadline.min())
+                        last_post_deadline_activity_day = int(days_after_deadline.max())
+                    if "event_bucket" in post_deadline_ev.columns:
+                        post_deadline_bucket_counts = post_deadline_ev["event_bucket"].value_counts().astype(int).to_dict()
 
         country = clean_text(r.get(country_col, "")) if country_col else ""
         income = clean_text(r.get(income_col, "")) if income_col else ""
@@ -9374,6 +9449,7 @@ def build_ml_prediction_dataset(data: dict):
             "Deadline": deadline_dt,
             "Payment Date": payment_dt,
             "Observation Cutoff": cutoff_dt,
+            "Observation Scope": observation_scope,
             "Actual Paid": int(is_paid),
             "Refund / Later Refunded": int(is_refund),
             "training_included": 1,
@@ -9385,6 +9461,16 @@ def build_ml_prediction_dataset(data: dict):
             "touchpoints_week2": week2,
             "touchpoints_week3": week3,
             "touchpoints_week4": week4,
+            "first30_touchpoints": int(first30_touchpoints),
+            "first30_active_days": int(first30_active_days),
+            "post_deadline_touchpoints": int(post_deadline_touchpoints),
+            "post_deadline_active_days": int(post_deadline_active_days),
+            "reactivated_after_deadline": int(reactivated_after_deadline),
+            "reactivation_gap_days": int(reactivation_gap_days),
+            "last_post_deadline_activity_day": int(last_post_deadline_activity_day),
+            "post_deadline_online_masterclass_count": int(post_deadline_bucket_counts.get("Online Events & Masterclasses", 0)),
+            "post_deadline_competition_count": int(post_deadline_bucket_counts.get("Competition", 0)),
+            "post_deadline_general_fun_count": int(post_deadline_bucket_counts.get("General/Fun", 0)),
             "online_masterclass_count": int(bucket_counts.get("Online Events & Masterclasses", 0)),
             "competition_count": int(bucket_counts.get("Competition", 0)),
             "general_fun_count": int(bucket_counts.get("General/Fun", 0)),
@@ -9413,6 +9499,10 @@ def build_ml_prediction_dataset(data: dict):
         row["touchpoints_per_active_day"] = round(total_touchpoints / active_days, 4) if active_days else 0.0
         row["meaningful_touchpoints"] = meaningful_touchpoints
         row["online_competition_count"] = int(row["online_masterclass_count"] + row["competition_count"])
+        row["post_deadline_meaningful_touchpoints"] = int(row["post_deadline_online_masterclass_count"] + row["post_deadline_competition_count"])
+        row["post_deadline_share"] = round(row["post_deadline_touchpoints"] / total_touchpoints, 4) if total_touchpoints else 0.0
+        row["active_after_deadline_only"] = int(row["post_deadline_touchpoints"] > 0 and row["first30_touchpoints"] == 0)
+        row["reactivation_quality_signal"] = int(row["post_deadline_meaningful_touchpoints"] > 0)
         row["general_only"] = int(total_touchpoints > 0 and row["general_fun_count"] == total_touchpoints and row["winner_spotlight_count"] == 0)
         row["no_activity_in_community"] = int(community_acquired and total_touchpoints == 0)
         row["active_out_community"] = int((not community_acquired) and total_touchpoints > 0)
@@ -9434,17 +9524,21 @@ def build_ml_prediction_dataset(data: dict):
                     "event_bucket": clean_text(er.get("event_bucket", "")),
                     "event_group": clean_text(er.get("event_group", "")),
                     "event_date": er.get("event_date", pd.NaT),
+                    "after_deadline": int(pd.notna(deadline_dt) and pd.notna(pd.to_datetime(er.get("event_date", pd.NaT), errors="coerce")) and pd.to_datetime(er.get("event_date", pd.NaT), errors="coerce").normalize() > deadline_dt),
                     "Actual Paid": int(is_paid),
                     "training_included": 1,
                 })
 
+    _ml_progress(progress_callback, 56, "Creating training matrix and event-attendance audit tables...")
     feature_df = pd.DataFrame(rows)
     event_rows_df = pd.DataFrame(event_rows)
     if feature_df.empty:
         return feature_df, pd.DataFrame(), pd.DataFrame(), event_rows_df
 
     train_df = feature_df[feature_df["training_included"].eq(1)].copy()
+    _ml_progress(progress_callback, 58, "Calculating event-level conversion intelligence...")
     event_intel_df = build_ml_event_conversion_intelligence(train_df, event_rows_df)
+    _ml_progress(progress_callback, 60, "Calculating repeated event-group conversion intelligence...")
     group_intel_df = build_ml_group_conversion_intelligence(train_df, event_rows_df)
     return feature_df, train_df, event_intel_df, group_intel_df
 
@@ -9518,11 +9612,16 @@ def _ml_feature_columns(df: pd.DataFrame):
     base_numeric = [
         "community_acquired", "total_touchpoints", "active_days", "first_activity_day", "last_activity_day",
         "touchpoints_week1", "touchpoints_week2", "touchpoints_week3", "touchpoints_week4",
+        "first30_touchpoints", "first30_active_days", "post_deadline_touchpoints",
+        "post_deadline_active_days", "reactivated_after_deadline", "reactivation_gap_days",
+        "last_post_deadline_activity_day", "post_deadline_online_masterclass_count",
+        "post_deadline_competition_count", "post_deadline_general_fun_count",
         "online_masterclass_count", "competition_count", "general_fun_count", "other_count",
         "winner_spotlight_count", "has_activity", "has_online_masterclass", "has_competition",
         "has_winner_spotlight", "missing_offered_date",
         "observation_days", "touchpoints_per_observed_day", "touchpoints_per_active_day",
-        "meaningful_touchpoints", "online_competition_count", "general_only",
+        "meaningful_touchpoints", "online_competition_count", "post_deadline_meaningful_touchpoints",
+        "post_deadline_share", "active_after_deadline_only", "reactivation_quality_signal", "general_only",
         "no_activity_in_community", "active_out_community", "activated_week1",
         "activated_week2", "activated_first30", "early_meaningful_activity",
         "high_quality_signal", "low_quality_activity_only",
@@ -9587,13 +9686,14 @@ def _ml_prediction_label(prob: float, threshold: float) -> str:
         return "Needs Nurture"
 
 
-def train_ml_payment_models(train_df: pd.DataFrame, preferred_model: str = "Gradient Boosting"):
+def train_ml_payment_models(train_df: pd.DataFrame, preferred_model: str = "Gradient Boosting", progress_callback=None, progress_start: int = 62, progress_end: int = 88):
     """Train and compare payment models using a held-out train/test split.
 
     Gradient Boosting is preferred for live scoring because it has been the
     strongest model on the current data. If it fails, the best F1/ROC model is
     used as a safe fallback.
     """
+    _ml_progress(progress_callback, progress_start, "Preparing train/test split and model feature columns...")
     if not SKLEARN_AVAILABLE:
         return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "scikit-learn is not installed. Add scikit-learn to requirements.txt to enable this page."
     if train_df is None or train_df.empty:
@@ -9644,7 +9744,12 @@ def train_ml_payment_models(train_df: pd.DataFrame, preferred_model: str = "Grad
 
     rows, confusion_rows, error_rows = [], [], []
     trained, thresholds = {}, {}
-    for name, model in _model_specs().items():
+    model_specs = _model_specs()
+    model_items = list(model_specs.items())
+    model_count = max(len(model_items), 1)
+    for model_pos, (name, model) in enumerate(model_items, start=1):
+        model_pct = progress_start + int((progress_end - progress_start - 6) * ((model_pos - 1) / model_count))
+        _ml_progress(progress_callback, model_pct, f"Training and evaluating {name} ({model_pos}/{model_count})...")
         pipe = Pipeline(steps=[("preprocess", _make_preprocess()), ("model", model)])
         try:
             fit_kwargs = {}
@@ -9723,6 +9828,7 @@ def train_ml_payment_models(train_df: pd.DataFrame, preferred_model: str = "Grad
     best_name = preferred_model if preferred_model in trained else fallback_best
     perf_df["Selected for Scoring"] = np.where(perf_df["Model"].astype(str).eq(best_name), "Yes", "")
 
+    _ml_progress(progress_callback, progress_end - 5, f"Selecting {best_name} and refitting on all labelled rows...")
     # Refit selected model on all included training rows for live scoring.
     best_model_template = _model_specs()[best_name]
     best_pipe = Pipeline(steps=[("preprocess", _make_preprocess()), ("model", best_model_template)])
@@ -9742,11 +9848,12 @@ def train_ml_payment_models(train_df: pd.DataFrame, preferred_model: str = "Grad
         best_pipe.ml_fallback_best_name_ = str(fallback_best)
     except Exception:
         pass
+    _ml_progress(progress_callback, progress_end - 1, "Calculating model feature importance and error audit...")
     importance_df = _ml_feature_importance(best_pipe, numeric_cols, categorical_cols)
     return best_pipe, perf_df, pd.DataFrame(confusion_rows), importance_df, pd.DataFrame(error_rows), ""
 
 
-def _ml_program_model_summary(train_df: pd.DataFrame) -> pd.DataFrame:
+def _ml_program_model_summary(train_df: pd.DataFrame, progress_callback=None, progress_start: int = 89, progress_end: int = 94) -> pd.DataFrame:
     """Train separate program-level models and show their holdout performance.
 
     This is diagnostic: live scoring continues to use the selected primary model
@@ -9755,7 +9862,11 @@ def _ml_program_model_summary(train_df: pd.DataFrame) -> pd.DataFrame:
     if train_df is None or train_df.empty or "Program" not in train_df.columns:
         return pd.DataFrame()
     rows = []
-    for program in sorted([p for p in train_df["Program"].dropna().astype(str).unique() if clean_text(p)]):
+    programs = sorted([p for p in train_df["Program"].dropna().astype(str).unique() if clean_text(p)])
+    total_programs = max(len(programs), 1)
+    for program_pos, program in enumerate(programs, start=1):
+        pct = progress_start + int((progress_end - progress_start) * ((program_pos - 1) / total_programs))
+        _ml_progress(progress_callback, pct, f"Running separate {program} model diagnostic ({program_pos}/{total_programs})...")
         subset = train_df[train_df["Program"].astype(str).eq(program)].copy()
         if subset.empty or subset["Actual Paid"].nunique() < 2 or subset["Actual Paid"].value_counts().min() < 5 or len(subset) < 40:
             rows.append({"Program": program, "Status": "Not enough class balance for a reliable split", "Rows": int(len(subset)), "Converted": int(subset.get("Actual Paid", pd.Series(dtype=int)).sum())})
@@ -9845,18 +9956,33 @@ def score_ml_students(model, feature_df: pd.DataFrame, threshold_mode: str = "Ba
 def render_ml_predictions_page(data):
     st.subheader("Tetr ML Prediction Dashboard")
     st.caption(
-        "Predicts payment/conversion probability from pre-payment behavior only. "
-        "Refunded students are included as converted because they paid once; post-payment behavior is excluded and can be used later for refund-risk prediction."
+        "Predicts payment/conversion probability from payment-safe behavior. "
+        "Converted students use only behavior before payment; unpaid students use all recorded activity so late reactivation after deadline is captured. "
+        "Refunded students are included as converted because they paid once; post-payment behavior after payment is excluded for this model."
     )
 
     if not SKLEARN_AVAILABLE:
         st.error("scikit-learn is not installed in this environment. Add `scikit-learn` to requirements.txt to enable ML training and scoring.")
         return
 
-    with st.spinner("Building pre-payment feature set, grouping repeated events, and training models..."):
-        feature_df, train_df, event_intel_df, group_intel_df = build_ml_prediction_dataset(data)
-        model, perf_df, confusion_df, importance_df, error_audit_df, err = train_ml_payment_models(train_df, preferred_model="Gradient Boosting")
-        program_perf_df = _ml_program_model_summary(train_df)
+    st.markdown("#### ML build status")
+    progress_bar = st.progress(0)
+    progress_status = st.empty()
+
+    def _update_ml_progress(pct, message):
+        pct = int(max(0, min(100, pct)))
+        progress_bar.progress(pct)
+        progress_status.markdown(f"**{pct}%** · {clean_text(message)}")
+
+    try:
+        _update_ml_progress(1, "Starting ML prediction pipeline...")
+        feature_df, train_df, event_intel_df, group_intel_df = build_ml_prediction_dataset(data, progress_callback=_update_ml_progress)
+        model, perf_df, confusion_df, importance_df, error_audit_df, err = train_ml_payment_models(train_df, preferred_model="Gradient Boosting", progress_callback=_update_ml_progress, progress_start=62, progress_end=88)
+        program_perf_df = _ml_program_model_summary(train_df, progress_callback=_update_ml_progress, progress_start=89, progress_end=94)
+    except Exception as e:
+        _update_ml_progress(100, "ML build failed. See error below.")
+        st.error(f"ML prediction build failed: {e}")
+        return
 
     if feature_df.empty:
         st.warning("No student feature rows could be built from the current data.")
@@ -9871,7 +9997,9 @@ def render_ml_predictions_page(data):
         help="Balanced uses the tuned F1 threshold. High Recall catches more possible converters. High Precision reduces false positives.",
         key="ml_threshold_mode",
     )
+    _update_ml_progress(96, "Scoring all students, including unpaid reactivation pipeline...")
     scored_df = score_ml_students(model, feature_df, threshold_mode=threshold_mode) if model is not None else pd.DataFrame()
+    _update_ml_progress(100, "ML prediction dashboard ready.")
 
     included = int(train_df.shape[0]) if train_df is not None else 0
     paid_rows = int(train_df["Actual Paid"].sum()) if train_df is not None and not train_df.empty else 0
@@ -9926,6 +10054,7 @@ def render_ml_predictions_page(data):
 
     tabs = st.tabs([
         "Unpaid Conversion Pipeline",
+        "Post-Deadline Reactivation",
         "All Student Predictions",
         "Model Performance",
         "Event Group Intelligence",
@@ -9953,8 +10082,9 @@ def render_ml_predictions_page(data):
             cols = [c for c in [
                 "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Counsellor", "Community Acquired",
                 "Payment Probability %", "Prediction Band", "Predicted Conversion", "Model Threshold",
-                "total_touchpoints", "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
-                "Why This Probability", "Recommended Conversion Actions", "Offered Date", "Deadline", "Observation Cutoff"
+                "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days",
+                "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
+                "Why This Probability", "Recommended Conversion Actions", "Offered Date", "Deadline", "Observation Scope", "Observation Cutoff"
             ] if c in show_df.columns]
             st.dataframe(show_df[cols].sort_values("Payment Probability %", ascending=False), use_container_width=True, height=620, hide_index=True, key="ml_unpaid_conversion_pipeline")
 
@@ -9980,6 +10110,58 @@ def render_ml_predictions_page(data):
                 st.dataframe(seg_summary.sort_values("Avg_Probability", ascending=False), use_container_width=True, hide_index=True, key="ml_unpaid_priority_segments")
 
     with tabs[1]:
+        st.markdown("#### Post-deadline reactivation signals")
+        st.caption("Shows students who became active after their deadline / 30-day journey. Converted students are still payment-safe because only activity before payment is used; unpaid students use all recorded participation so late interest is visible.")
+        reactivation_base = scored_df.copy() if not scored_df.empty else feature_df.copy()
+        if reactivation_base.empty or "reactivated_after_deadline" not in reactivation_base.columns:
+            st.info("No reactivation features are available from the current dataset.")
+        else:
+            react_df = reactivation_base[pd.to_numeric(reactivation_base.get("reactivated_after_deadline", 0), errors="coerce").fillna(0).astype(int).eq(1)].copy()
+            unpaid_react_df = react_df[pd.to_numeric(react_df.get("Actual Paid", 0), errors="coerce").fillna(0).astype(int).eq(0)].copy() if not react_df.empty else pd.DataFrame()
+            rc1, rc2, rc3, rc4 = st.columns(4)
+            rc1.metric("Reactivated Students", f"{len(react_df):,}")
+            rc2.metric("Unpaid Reactivated", f"{len(unpaid_react_df):,}")
+            if not unpaid_react_df.empty and "Prediction Band" in unpaid_react_df.columns:
+                rc3.metric("High Intent Reactivated", f"{int(unpaid_react_df['Prediction Band'].astype(str).isin(['Very High Intent', 'High Intent']).sum()):,}")
+            else:
+                rc3.metric("High Intent Reactivated", "0")
+            avg_gap = pd.to_numeric(unpaid_react_df.get("reactivation_gap_days", pd.Series(dtype=float)), errors="coerce").replace(999, np.nan).mean() if not unpaid_react_df.empty else np.nan
+            rc4.metric("Avg Gap After Deadline", f"{avg_gap:.1f} days" if pd.notna(avg_gap) else "—")
+
+            if react_df.empty:
+                st.info("No students show post-deadline reactivation in the current observation window.")
+            else:
+                program_values = sorted([x for x in react_df.get("Program", pd.Series(dtype=str)).dropna().astype(str).unique() if x]) if "Program" in react_df.columns else []
+                program_filter = st.multiselect("Program", program_values, default=program_values, key="ml_reactivation_program_filter")
+                only_unpaid = st.checkbox("Show unpaid students only", value=True, key="ml_reactivation_unpaid_only")
+                show_react = react_df.copy()
+                if only_unpaid:
+                    show_react = show_react[pd.to_numeric(show_react.get("Actual Paid", 0), errors="coerce").fillna(0).astype(int).eq(0)].copy()
+                if program_filter and "Program" in show_react.columns:
+                    show_react = show_react[show_react["Program"].astype(str).isin(program_filter)]
+                summary = show_react.groupby("Program", as_index=False).agg(
+                    Students=("student_id", "nunique"),
+                    Avg_Probability=("Payment Probability %", "mean"),
+                    Avg_Reactivation_Gap=("reactivation_gap_days", lambda s: pd.to_numeric(s, errors="coerce").replace(999, np.nan).mean()),
+                    Avg_Post_Deadline_Touchpoints=("post_deadline_touchpoints", "mean"),
+                ) if not show_react.empty and "Program" in show_react.columns else pd.DataFrame()
+                if not summary.empty:
+                    summary["Avg_Probability"] = summary["Avg_Probability"].round(1)
+                    summary["Avg_Reactivation_Gap"] = summary["Avg_Reactivation_Gap"].round(1)
+                    summary["Avg_Post_Deadline_Touchpoints"] = summary["Avg_Post_Deadline_Touchpoints"].round(2)
+                    st.dataframe(summary.sort_values("Avg_Probability", ascending=False), use_container_width=True, hide_index=True, key="ml_reactivation_summary")
+                cols = [c for c in [
+                    "Name", "Email", "Program", "Batch", "Course", "Country", "Community Acquired",
+                    "Payment Probability %", "Prediction Band", "Predicted Conversion",
+                    "post_deadline_touchpoints", "post_deadline_meaningful_touchpoints", "post_deadline_online_masterclass_count",
+                    "post_deadline_competition_count", "post_deadline_general_fun_count", "reactivation_gap_days",
+                    "active_after_deadline_only", "reactivation_quality_signal", "Why This Probability", "Recommended Conversion Actions",
+                    "Offered Date", "Deadline", "Observation Scope"
+                ] if c in show_react.columns]
+                if cols:
+                    st.dataframe(show_react[cols].sort_values(["Payment Probability %", "post_deadline_touchpoints"], ascending=[False, False]), use_container_width=True, height=560, hide_index=True, key="ml_reactivation_table")
+
+    with tabs[2]:
         st.markdown("#### All student-level payment probabilities")
         if scored_df.empty:
             st.info("Student probability scoring is unavailable until a model is trained successfully.")
@@ -10008,15 +10190,16 @@ def render_ml_predictions_page(data):
             cols = [c for c in [
                 "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Community Acquired",
                 "Payment Probability %", "Prediction Band", "Predicted Conversion", "Threshold Mode", "Model Threshold", "Actual Paid",
-                "total_touchpoints", "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
-                "Why This Probability", "Recommended Conversion Actions", "Offered Date", "Observation Cutoff"
+                "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days",
+                "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
+                "Why This Probability", "Recommended Conversion Actions", "Offered Date", "Deadline", "Observation Scope", "Observation Cutoff"
             ] if c in show_df.columns]
             display = show_df[cols].copy()
             if "Actual Paid" in display.columns:
                 display["Actual Paid"] = display["Actual Paid"].map(lambda x: "Yes" if int(x) == 1 else "No")
             st.dataframe(display, use_container_width=True, height=560, hide_index=True, key="ml_student_predictions_table")
 
-    with tabs[2]:
+    with tabs[3]:
         st.markdown("#### Train/test model performance")
         st.caption("Models are trained on historical conversion outcomes using stratified train/test split. The selected model is then refit on all labelled data before live unpaid scoring.")
         if perf_df is not None and not perf_df.empty:
@@ -10036,7 +10219,7 @@ def render_ml_predictions_page(data):
         else:
             st.info("Program-level model performance is unavailable.")
 
-    with tabs[3]:
+    with tabs[4]:
         st.markdown("#### Repetitive event-group conversion intelligence")
         st.caption("Groups combine repeated sessions across batches using speaker/topic/challenge keywords. This section is correlation, not causation, but these same group features are included in the ML model.")
         min_att = st.slider("Minimum attended students", 1, 100, 10, key="ml_group_min_attended")
@@ -10065,9 +10248,9 @@ def render_ml_predictions_page(data):
             cov = pd.DataFrame(cov_rows).sort_values("Students with Signal", ascending=False)
             st.dataframe(cov, use_container_width=True, hide_index=True, height=360, key="ml_group_feature_coverage")
 
-    with tabs[4]:
+    with tabs[5]:
         st.markdown("#### Event-level conversion intelligence")
-        st.caption("Specific event rows before payment/cutoff, shown after grouping to help inspect which individual sessions are lifting conversion.")
+        st.caption("Specific event rows inside each student's observation window: before payment for converted students and all recorded activity for unpaid students.")
         min_att_event = st.slider("Minimum event attendees", 1, 100, 10, key="ml_event_min_attended")
         edf = event_intel_df[event_intel_df["Attended Students"].ge(min_att_event)].copy() if event_intel_df is not None and not event_intel_df.empty else pd.DataFrame()
         if not edf.empty:
@@ -10079,7 +10262,7 @@ def render_ml_predictions_page(data):
         else:
             st.info("No event rows meet the selected attendance threshold.")
 
-    with tabs[5]:
+    with tabs[6]:
         st.markdown("#### Model factor importance")
         if importance_df is not None and not importance_df.empty:
             st.dataframe(importance_df, use_container_width=True, hide_index=True, key="ml_feature_importance_table")
@@ -10090,7 +10273,7 @@ def render_ml_predictions_page(data):
         else:
             st.info("Feature importance is unavailable for the selected model.")
 
-    with tabs[6]:
+    with tabs[7]:
         st.markdown("#### False positive / false negative audit")
         st.caption("Held-out test rows where model prediction differed from actual conversion label.")
         if error_audit_df is not None and not error_audit_df.empty:
@@ -10107,13 +10290,14 @@ def render_ml_predictions_page(data):
         else:
             st.info("No held-out prediction errors available, or model training did not complete.")
 
-    with tabs[7]:
+    with tabs[8]:
         st.markdown("#### Training feature dataset audit")
-        st.caption("Refund rows are included as converted. Behavior columns are built only up to payment date for converted students and first-30-days cutoff for non-converted students.")
+        st.caption("Refund rows are included as converted. Converted students use only pre-payment behavior; unpaid students use all recorded activity, including post-deadline reactivation after the 30-day journey.")
         audit_cols = [c for c in [
             "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Income", "Counsellor", "Community Acquired",
-            "Actual Paid", "Refund / Later Refunded", "training_included", "Offered Date", "Deadline", "Payment Date", "Observation Cutoff",
-            "total_touchpoints", "active_days", "observation_days", "touchpoints_per_observed_day", "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count", "meaningful_touchpoints", "general_only",
+            "Actual Paid", "Refund / Later Refunded", "training_included", "Offered Date", "Deadline", "Payment Date", "Observation Scope", "Observation Cutoff",
+            "total_touchpoints", "first30_touchpoints", "first30_active_days", "post_deadline_touchpoints", "post_deadline_active_days", "reactivated_after_deadline", "reactivation_gap_days", "post_deadline_meaningful_touchpoints", "active_after_deadline_only", "reactivation_quality_signal",
+            "active_days", "observation_days", "touchpoints_per_observed_day", "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count", "meaningful_touchpoints", "general_only",
             "group_count_welcome_webinar", "group_count_life_at_tetr", "group_count_garima_learning", "group_count_pratham_founder", "group_count_tarun_cofounder", "group_count_amitoj_opportunities", "group_count_shahrose_visa", "group_count_career_linkedin", "group_count_netflix_ceo", "group_count_startup_hackathon", "group_count_tetr_club", "group_count_ai_voice_hackathon"
         ] if c in feature_df.columns]
         st.dataframe(feature_df[audit_cols], use_container_width=True, height=560, hide_index=True, key="ml_training_audit_table")
