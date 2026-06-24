@@ -9297,6 +9297,26 @@ def _ml_event_weight(event_bucket: str, event_group: str = "") -> float:
     return float(min(weight, 3.00))
 
 
+def _ml_safe_ratio(numerator, denominator, cap_denominator=None) -> float:
+    """Supportive ratio for ML features.
+
+    Raw eligible-event ratios can become too strict when a batch has many possible
+    activities. This helper keeps eligible-event features as positive/supportive
+    signals instead of allowing a large denominator to push good students toward
+    zero probability. Display tables still show the true raw ratios.
+    """
+    try:
+        n = float(numerator or 0)
+        d = float(denominator or 0)
+        if cap_denominator is not None and d > 0:
+            d = min(d, float(cap_denominator))
+        if d <= 0:
+            return 0.0
+        return round(max(0.0, min(1.0, n / d)), 4)
+    except Exception:
+        return 0.0
+
+
 def _ml_engagement_quality_label(raw_label: str) -> str:
     return {
         "High Impact": "High Engaged",
@@ -9758,13 +9778,27 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None, program_filt
             "eligible_weighted_event_score": float(eligible_core_metrics.get("eligible_weighted_event_score", 0.0)),
             "eligible_weighted_attended_score": float(eligible_core_metrics.get("eligible_weighted_attended_score", 0.0)),
             "weighted_engagement_rate": float(eligible_core_metrics.get("weighted_engagement_rate", 0.0)),
+            # Supportive model features: true eligible ratios are displayed above, but
+            # the model gets capped ratios so a large event denominator does not
+            # incorrectly make meaningful/high-impact activity look like zero intent.
+            "eligible_data_available": int(int(eligible_core_metrics.get("eligible_events", 0)) > 0),
+            "eligible_meaningful_data_available": int(int(eligible_core_metrics.get("eligible_meaningful_events", 0)) > 0),
+            "eligible_attendance_signal": _ml_safe_ratio(eligible_core_metrics.get("eligible_attended_events", 0), eligible_core_metrics.get("eligible_events", 0), cap_denominator=6),
+            "eligible_meaningful_signal": _ml_safe_ratio(eligible_core_metrics.get("eligible_meaningful_attended_events", 0), eligible_core_metrics.get("eligible_meaningful_events", 0), cap_denominator=4),
+            "weighted_engagement_signal": _ml_safe_ratio(eligible_core_metrics.get("eligible_weighted_attended_score", 0.0), eligible_core_metrics.get("eligible_weighted_event_score", 0.0), cap_denominator=12),
             "post_deadline_eligible_events": int(eligible_late_metrics.get("eligible_events", 0)),
             "post_deadline_attended_eligible_events": int(eligible_late_metrics.get("eligible_attended_events", 0)),
             "post_deadline_eligible_attendance_rate": float(eligible_late_metrics.get("eligible_attendance_rate", 0.0)),
             "post_deadline_weighted_engagement_rate": float(eligible_late_metrics.get("weighted_engagement_rate", 0.0)),
+            "post_deadline_eligible_data_available": int(int(eligible_late_metrics.get("eligible_events", 0)) > 0),
+            "post_deadline_eligible_signal": _ml_safe_ratio(eligible_late_metrics.get("eligible_attended_events", 0), eligible_late_metrics.get("eligible_events", 0), cap_denominator=4),
+            "post_deadline_weighted_engagement_signal": _ml_safe_ratio(eligible_late_metrics.get("eligible_weighted_attended_score", 0.0), eligible_late_metrics.get("eligible_weighted_event_score", 0.0), cap_denominator=8),
             "high_impact_group_touchpoints": int(high_impact_group_touchpoints),
             "high_impact_group_diversity": int(high_impact_group_diversity),
+            "has_high_impact_group": int(high_impact_group_touchpoints > 0),
+            "high_impact_group_intensity": int(min(high_impact_group_touchpoints, 4)),
             "post_deadline_high_impact_group_touchpoints": int(post_deadline_high_impact_group_touchpoints),
+            "has_post_deadline_high_impact_group": int(post_deadline_high_impact_group_touchpoints > 0),
             "winner_spotlight_count": int(winner_count),
             "has_activity": int(total_touchpoints > 0),
             "has_online_masterclass": int(bucket_counts.get("Online Events & Masterclasses", 0) > 0),
@@ -10001,12 +10035,15 @@ def _ml_feature_columns(df: pd.DataFrame):
         "first30_touchpoints", "first30_active_days", "online_masterclass_count", "competition_count", "general_fun_count", "other_count",
         "winner_spotlight_count", "has_activity", "has_online_masterclass", "has_competition",
         "has_winner_spotlight", "missing_offered_date",
-        "eligible_events", "eligible_attended_events", "eligible_attendance_rate",
-        "eligible_meaningful_events", "eligible_meaningful_attended_events", "eligible_meaningful_attendance_rate",
-        "eligible_weighted_event_score", "eligible_weighted_attended_score", "weighted_engagement_rate",
-        "post_deadline_eligible_events", "post_deadline_attended_eligible_events", "post_deadline_eligible_attendance_rate", "post_deadline_weighted_engagement_rate",
+        # Display-only raw eligible denominators are intentionally not used directly
+        # by the model because they made predictions too strict. The model uses
+        # supportive/capped eligible signals plus attended counts instead.
+        "eligible_data_available", "eligible_attended_events", "eligible_attendance_signal",
+        "eligible_meaningful_data_available", "eligible_meaningful_attended_events", "eligible_meaningful_signal",
+        "eligible_weighted_attended_score", "weighted_engagement_signal",
+        "post_deadline_eligible_data_available", "post_deadline_attended_eligible_events", "post_deadline_eligible_signal", "post_deadline_weighted_engagement_signal",
         "engagement_quality_score", "weighted_engagement_score", "post_deadline_weighted_engagement_score", "safe_weighted_engagement_score_including_late",
-        "high_impact_group_touchpoints", "high_impact_group_diversity", "post_deadline_high_impact_group_touchpoints",
+        "high_impact_group_touchpoints", "high_impact_group_diversity", "has_high_impact_group", "high_impact_group_intensity", "post_deadline_high_impact_group_touchpoints", "has_post_deadline_high_impact_group",
         "observation_days", "touchpoints_per_observed_day", "touchpoints_per_active_day",
         "meaningful_touchpoints", "online_competition_count", "general_only",
         "no_activity_in_community", "active_out_community", "activated_week1",
@@ -10491,9 +10528,9 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                 "Payment Probability %", "Prediction Band", "Predicted Conversion", "Model Threshold",
                 "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days",
                 "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
-                "Engagement Quality", "engagement_quality_score", "weighted_engagement_score", "eligible_events", "eligible_attended_events", "eligible_attendance_rate",
-                "eligible_meaningful_events", "eligible_meaningful_attended_events", "eligible_meaningful_attendance_rate", "weighted_engagement_rate",
-                "high_impact_group_touchpoints", "high_impact_group_diversity",
+                "Engagement Quality", "engagement_quality_score", "weighted_engagement_score", "eligible_events", "eligible_attended_events", "eligible_attendance_rate", "eligible_attendance_signal",
+                "eligible_meaningful_events", "eligible_meaningful_attended_events", "eligible_meaningful_attendance_rate", "eligible_meaningful_signal", "weighted_engagement_rate", "weighted_engagement_signal",
+                "high_impact_group_touchpoints", "high_impact_group_diversity", "has_high_impact_group", "high_impact_group_intensity",
                 "Why This Probability", "Recommended Conversion Actions", "Offered Date", "Deadline", "Observation Scope", "Observation Cutoff"
             ] if c in show_df.columns]
             st.dataframe(show_df[cols].sort_values("Payment Probability %", ascending=False), use_container_width=True, height=620, hide_index=True, key=_ml_key("ml_unpaid_conversion_pipeline"))
@@ -10603,9 +10640,9 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                 "Payment Probability %", "Prediction Band", "Predicted Conversion", "Threshold Mode", "Model Threshold", "Actual Paid",
                 "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days",
                 "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
-                "Engagement Quality", "engagement_quality_score", "weighted_engagement_score", "eligible_events", "eligible_attended_events", "eligible_attendance_rate",
-                "eligible_meaningful_events", "eligible_meaningful_attended_events", "eligible_meaningful_attendance_rate", "weighted_engagement_rate",
-                "high_impact_group_touchpoints", "high_impact_group_diversity",
+                "Engagement Quality", "engagement_quality_score", "weighted_engagement_score", "eligible_events", "eligible_attended_events", "eligible_attendance_rate", "eligible_attendance_signal",
+                "eligible_meaningful_events", "eligible_meaningful_attended_events", "eligible_meaningful_attendance_rate", "eligible_meaningful_signal", "weighted_engagement_rate", "weighted_engagement_signal",
+                "high_impact_group_touchpoints", "high_impact_group_diversity", "has_high_impact_group", "high_impact_group_intensity",
                 "Why This Probability", "Recommended Conversion Actions", "Offered Date", "Deadline", "Observation Scope", "Observation Cutoff"
             ] if c in show_df.columns]
             display = show_df[cols].copy()
@@ -10662,6 +10699,21 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
             cov = pd.DataFrame(cov_rows).sort_values("Students with Signal", ascending=False)
             st.dataframe(cov, use_container_width=True, hide_index=True, height=360, key=_ml_key("ml_group_feature_coverage"))
 
+        st.markdown("##### ML feature signal health")
+        health_rows = []
+        for label, col in [
+            ("Any eligible-event data", "eligible_data_available"),
+            ("Any eligible attendance", "eligible_attended_events"),
+            ("Any meaningful eligible attendance", "eligible_meaningful_attended_events"),
+            ("Any high-impact repeated group", "has_high_impact_group"),
+            ("Any winner/spotlight signal", "has_winner_spotlight"),
+        ]:
+            if col in feature_df.columns:
+                vals = pd.to_numeric(feature_df[col], errors="coerce").fillna(0)
+                health_rows.append({"Signal": label, "Students with Signal": int(vals.gt(0).sum()), "% of Students": round(float(vals.gt(0).mean() * 100), 1) if len(vals) else 0.0})
+        if health_rows:
+            st.dataframe(pd.DataFrame(health_rows), use_container_width=True, hide_index=True, key=_ml_key("ml_feature_signal_health"))
+
     with tabs[5]:
         st.markdown("#### Event-level conversion intelligence")
         st.caption("Specific event rows inside the journey-safe observation window. Payments within 7 and 10 days after event attendance are shown to identify events most closely connected to conversion.")
@@ -10713,8 +10765,8 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
             "total_touchpoints", "first30_touchpoints", "first30_active_days", "post_deadline_touchpoints", "post_deadline_active_days", "reactivated_after_deadline", "reactivation_gap_days", "post_deadline_meaningful_touchpoints", "active_after_deadline_only", "reactivation_quality_signal",
             "active_days", "observation_days", "touchpoints_per_observed_day", "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count", "meaningful_touchpoints", "general_only",
             "Engagement Quality", "engagement_quality_score", "weighted_engagement_score", "safe_weighted_engagement_score_including_late",
-            "eligible_events", "eligible_attended_events", "eligible_attendance_rate", "eligible_meaningful_events", "eligible_meaningful_attended_events", "eligible_meaningful_attendance_rate", "eligible_weighted_event_score", "eligible_weighted_attended_score", "weighted_engagement_rate",
-            "post_deadline_eligible_events", "post_deadline_attended_eligible_events", "post_deadline_eligible_attendance_rate", "post_deadline_weighted_engagement_rate", "high_impact_group_touchpoints", "high_impact_group_diversity",
+            "eligible_events", "eligible_attended_events", "eligible_attendance_rate", "eligible_attendance_signal", "eligible_meaningful_events", "eligible_meaningful_attended_events", "eligible_meaningful_attendance_rate", "eligible_meaningful_signal", "eligible_weighted_event_score", "eligible_weighted_attended_score", "weighted_engagement_rate", "weighted_engagement_signal",
+            "post_deadline_eligible_events", "post_deadline_attended_eligible_events", "post_deadline_eligible_attendance_rate", "post_deadline_eligible_signal", "post_deadline_weighted_engagement_rate", "post_deadline_weighted_engagement_signal", "high_impact_group_touchpoints", "high_impact_group_diversity", "has_high_impact_group", "high_impact_group_intensity",
             "group_count_welcome_webinar", "group_count_life_at_tetr", "group_count_garima_learning", "group_count_pratham_founder", "group_count_tarun_cofounder", "group_count_amitoj_opportunities", "group_count_shahrose_visa", "group_count_career_linkedin", "group_count_netflix_ceo", "group_count_startup_hackathon", "group_count_tetr_club", "group_count_ai_voice_hackathon"
         ] if c in feature_df.columns]
         st.dataframe(feature_df[audit_cols], use_container_width=True, height=560, hide_index=True, key=_ml_key("ml_training_audit_table"))
