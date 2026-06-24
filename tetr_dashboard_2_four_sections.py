@@ -8858,15 +8858,20 @@ def _ml_region_from_country(country: str) -> str:
 
 
 def _ml_probability_band(prob: float) -> str:
+    """Student-facing confidence buckets for payment probability."""
     try:
         p = float(prob)
     except Exception:
         p = 0.0
-    if p >= 0.70:
+    if p >= 0.80:
+        return "Very High Intent"
+    if p >= 0.65:
         return "High Intent"
     if p >= 0.40:
         return "Medium Intent"
-    return "Low Intent"
+    if p >= 0.20:
+        return "Low Intent"
+    return "Cold"
 
 
 def _ml_student_reason(row: pd.Series) -> str:
@@ -9359,17 +9364,16 @@ def _ml_feature_columns(df: pd.DataFrame):
 
 
 def _ml_choose_threshold(y_true, proba, min_precision: float = 0.0) -> float:
-    """Choose an operating threshold from training predictions.
+    """Choose the balanced operating threshold from training predictions.
 
-    The model still reports ROC AUC from probabilities. Precision/recall/F1 are
-    calculated at this tuned threshold instead of a fixed 0.50 cutoff, which is
-    usually too blunt for imbalanced conversion data.
+    ROC AUC is still reported from probabilities. Precision/recall/F1 are
+    calculated at this tuned threshold instead of a fixed 0.50 cutoff.
     """
     try:
         y_arr = np.asarray(y_true).astype(int)
         p_arr = np.asarray(proba).astype(float)
         candidates = np.unique(np.r_[np.linspace(0.05, 0.95, 91), p_arr])
-        best_thr, best_score, best_f1, best_precision, best_recall = 0.50, -1.0, -1.0, -1.0, -1.0
+        best_thr, best_score = 0.50, -1.0
         for thr in candidates:
             pred = (p_arr >= thr).astype(int)
             precision = precision_score(y_arr, pred, zero_division=0)
@@ -9380,7 +9384,7 @@ def _ml_choose_threshold(y_true, proba, min_precision: float = 0.0) -> float:
             # Prefer F1, then precision, then recall.
             score = f1 + (precision * 0.001) + (recall * 0.0001)
             if score > best_score:
-                best_thr, best_score, best_f1, best_precision, best_recall = float(thr), float(score), float(f1), float(precision), float(recall)
+                best_thr, best_score = float(thr), float(score)
         if best_score < 0:
             return 0.50
         return max(0.01, min(0.99, best_thr))
@@ -9388,14 +9392,41 @@ def _ml_choose_threshold(y_true, proba, min_precision: float = 0.0) -> float:
         return 0.50
 
 
-def train_ml_payment_models(train_df: pd.DataFrame):
+def _ml_threshold_for_mode(base_threshold: float, mode: str) -> float:
+    """Translate the tuned balanced threshold into practical dashboard modes."""
+    try:
+        base = float(base_threshold)
+    except Exception:
+        base = 0.50
+    mode = clean_text(mode).lower()
+    if "recall" in mode:
+        return max(0.05, min(0.95, base - 0.15))
+    if "precision" in mode:
+        return max(0.05, min(0.95, base + 0.15))
+    return max(0.05, min(0.95, base))
+
+
+def _ml_prediction_label(prob: float, threshold: float) -> str:
+    try:
+        return "Likely to Pay" if float(prob) >= float(threshold) else "Needs Nurture"
+    except Exception:
+        return "Needs Nurture"
+
+
+def train_ml_payment_models(train_df: pd.DataFrame, preferred_model: str = "Gradient Boosting"):
+    """Train and compare payment models using a held-out train/test split.
+
+    Gradient Boosting is preferred for live scoring because it has been the
+    strongest model on the current data. If it fails, the best F1/ROC model is
+    used as a safe fallback.
+    """
     if not SKLEARN_AVAILABLE:
-        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "scikit-learn is not installed. Add scikit-learn to requirements.txt to enable this page."
+        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "scikit-learn is not installed. Add scikit-learn to requirements.txt to enable this page."
     if train_df is None or train_df.empty:
-        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "No training rows available."
+        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "No training rows available."
     y = train_df["Actual Paid"].astype(int)
     if y.nunique() < 2 or len(train_df) < 30 or y.value_counts().min() < 5:
-        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "Not enough paid and unpaid rows for a reliable train/test split."
+        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "Not enough paid and unpaid rows for a reliable train/test split."
 
     numeric_cols, categorical_cols = _ml_feature_columns(train_df)
     X = train_df[numeric_cols + categorical_cols].copy()
@@ -9404,20 +9435,29 @@ def train_ml_payment_models(train_df: pd.DataFrame):
     for c in categorical_cols:
         X[c] = X[c].astype(str).fillna("Unknown")
 
-    try:
-        encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False, min_frequency=5)
-    except TypeError:
+    def _make_preprocess():
         try:
-            encoder = OneHotEncoder(handle_unknown="ignore", sparse=False, min_frequency=5)
+            encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False, min_frequency=5)
         except TypeError:
-            encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
-    preprocess = ColumnTransformer(
-        transformers=[
-            ("num", "passthrough", numeric_cols),
-            ("cat", encoder, categorical_cols),
-        ],
-        remainder="drop",
-    )
+            try:
+                encoder = OneHotEncoder(handle_unknown="ignore", sparse=False, min_frequency=5)
+            except TypeError:
+                encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
+        return ColumnTransformer(
+            transformers=[
+                ("num", "passthrough", numeric_cols),
+                ("cat", encoder, categorical_cols),
+            ],
+            remainder="drop",
+        )
+
+    def _model_specs():
+        return {
+            "Logistic Regression": LogisticRegression(max_iter=3000, class_weight="balanced", solver="liblinear", C=0.7),
+            "Random Forest": RandomForestClassifier(n_estimators=500, random_state=42, class_weight="balanced_subsample", min_samples_leaf=2, max_features="sqrt", n_jobs=-1),
+            "Extra Trees": ExtraTreesClassifier(n_estimators=500, random_state=42, class_weight="balanced", min_samples_leaf=2, max_features="sqrt", n_jobs=-1),
+            "Gradient Boosting": GradientBoostingClassifier(random_state=42, n_estimators=220, learning_rate=0.04, max_depth=3, subsample=0.85),
+        }
 
     test_size = 0.25 if len(train_df) >= 80 else 0.30
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y)
@@ -9428,29 +9468,17 @@ def train_ml_payment_models(train_df: pd.DataFrame):
     pos_rate = float(y.mean()) if len(y) else 0.0
     min_precision_target = max(0.0, min(0.45, pos_rate + 0.05))
 
-    models = {
-        "Logistic Regression": LogisticRegression(max_iter=3000, class_weight="balanced", solver="liblinear", C=0.7),
-        "Random Forest": RandomForestClassifier(n_estimators=500, random_state=42, class_weight="balanced_subsample", min_samples_leaf=2, max_features="sqrt", n_jobs=-1),
-        "Extra Trees": ExtraTreesClassifier(n_estimators=500, random_state=42, class_weight="balanced", min_samples_leaf=2, max_features="sqrt", n_jobs=-1),
-        "Gradient Boosting": GradientBoostingClassifier(random_state=42, n_estimators=180, learning_rate=0.045, max_depth=3, subsample=0.85),
-    }
-    rows = []
-    trained = {}
-    confusion_rows = []
-    thresholds = {}
-    for name, model in models.items():
-        pipe = Pipeline(steps=[("preprocess", preprocess), ("model", model)])
+    rows, confusion_rows, error_rows = [], [], []
+    trained, thresholds = {}, {}
+    for name, model in _model_specs().items():
+        pipe = Pipeline(steps=[("preprocess", _make_preprocess()), ("model", model)])
         try:
             fit_kwargs = {}
             if name in {"Gradient Boosting"}:
                 fit_kwargs["model__sample_weight"] = train_sample_weight
             pipe.fit(X_train, y_train, **fit_kwargs)
-            if hasattr(pipe, "predict_proba"):
-                train_proba = pipe.predict_proba(X_train)[:, 1]
-                proba = pipe.predict_proba(X_test)[:, 1]
-            else:
-                train_proba = pipe.predict(X_train)
-                proba = pipe.predict(X_test)
+            train_proba = pipe.predict_proba(X_train)[:, 1] if hasattr(pipe, "predict_proba") else pipe.predict(X_train)
+            proba = pipe.predict_proba(X_test)[:, 1] if hasattr(pipe, "predict_proba") else pipe.predict(X_test)
             threshold = _ml_choose_threshold(y_train, train_proba, min_precision=min_precision_target)
             pred = (proba >= threshold).astype(int)
             try:
@@ -9468,6 +9496,7 @@ def train_ml_payment_models(train_df: pd.DataFrame):
             tn, fp, fn, tp = confusion_matrix(y_test, pred, labels=[0, 1]).ravel()
             rows.append({
                 "Model": name,
+                "Primary Model": "Yes" if name == preferred_model else "",
                 "Accuracy": round(acc, 3),
                 "Balanced Accuracy": round(float(bal_acc), 3) if pd.notna(bal_acc) else np.nan,
                 "Precision": round(precision, 3),
@@ -9479,24 +9508,50 @@ def train_ml_payment_models(train_df: pd.DataFrame):
                 "Test Rows": int(len(X_test)),
             })
             confusion_rows.append({"Model": name, "Threshold": round(float(threshold), 3), "True Negative": int(tn), "False Positive": int(fp), "False Negative": int(fn), "True Positive": int(tp)})
+            for row_idx, actual, predicted, probability in zip(y_test.index, np.asarray(y_test).astype(int), pred.astype(int), proba.astype(float)):
+                if int(actual) == int(predicted):
+                    continue
+                src = train_df.loc[row_idx]
+                error_rows.append({
+                    "Model": name,
+                    "Error Type": "False Positive" if int(predicted) == 1 else "False Negative",
+                    "Payment Probability %": round(float(probability) * 100, 1),
+                    "Threshold": round(float(threshold), 3),
+                    "Actual Paid": "Yes" if int(actual) == 1 else "No",
+                    "Predicted": "Likely to Pay" if int(predicted) == 1 else "Needs Nurture",
+                    "Name": clean_text(src.get("Name", src.get("student_name", ""))),
+                    "Email": clean_text(src.get("Email", src.get("email_key", ""))),
+                    "Program": clean_text(src.get("Program", "")),
+                    "Batch": clean_text(src.get("Batch", "")),
+                    "Country": clean_text(src.get("Country", "")),
+                    "Community Acquired": clean_text(src.get("Community Acquired", "")),
+                    "total_touchpoints": int(src.get("total_touchpoints", 0) or 0),
+                    "online_masterclass_count": int(src.get("online_masterclass_count", 0) or 0),
+                    "competition_count": int(src.get("competition_count", 0) or 0),
+                    "general_fun_count": int(src.get("general_fun_count", 0) or 0),
+                    "winner_spotlight_count": int(src.get("winner_spotlight_count", 0) or 0),
+                    "Top Factors": _ml_student_reason(src),
+                })
             trained[name] = pipe
             thresholds[name] = threshold
         except Exception as e:
-            rows.append({"Model": name, "Accuracy": np.nan, "Balanced Accuracy": np.nan, "Precision": np.nan, "Recall": np.nan, "F1": np.nan, "ROC AUC": np.nan, "Threshold": np.nan, "Train Rows": int(len(X_train)), "Test Rows": int(len(X_test)), "Error": str(e)})
+            rows.append({"Model": name, "Primary Model": "Yes" if name == preferred_model else "", "Accuracy": np.nan, "Balanced Accuracy": np.nan, "Precision": np.nan, "Recall": np.nan, "F1": np.nan, "ROC AUC": np.nan, "Threshold": np.nan, "Train Rows": int(len(X_train)), "Test Rows": int(len(X_test)), "Error": str(e)})
 
     perf_df = pd.DataFrame(rows)
     if perf_df.empty or not trained:
-        return None, perf_df, pd.DataFrame(confusion_rows), pd.DataFrame(), "Model training failed."
+        return None, perf_df, pd.DataFrame(confusion_rows), pd.DataFrame(), pd.DataFrame(error_rows), "Model training failed."
+
     rank = perf_df.copy()
     rank["_f1_rank"] = pd.to_numeric(rank.get("F1", np.nan), errors="coerce").fillna(-1)
     rank["_auc_rank"] = pd.to_numeric(rank.get("ROC AUC", np.nan), errors="coerce").fillna(-1)
     rank["_precision_rank"] = pd.to_numeric(rank.get("Precision", np.nan), errors="coerce").fillna(-1)
-    # Choose the strongest operating model for student scoring: F1 first, then AUC, then precision.
-    best_name = rank.sort_values(["_f1_rank", "_auc_rank", "_precision_rank"], ascending=False).iloc[0]["Model"]
+    fallback_best = rank.sort_values(["_f1_rank", "_auc_rank", "_precision_rank"], ascending=False).iloc[0]["Model"]
+    best_name = preferred_model if preferred_model in trained else fallback_best
+    perf_df["Selected for Scoring"] = np.where(perf_df["Model"].astype(str).eq(best_name), "Yes", "")
 
     # Refit selected model on all included training rows for live scoring.
-    best_model_template = models[best_name]
-    best_pipe = Pipeline(steps=[("preprocess", preprocess), ("model", best_model_template)])
+    best_model_template = _model_specs()[best_name]
+    best_pipe = Pipeline(steps=[("preprocess", _make_preprocess()), ("model", best_model_template)])
     if best_name in {"Gradient Boosting"}:
         y_all = np.asarray(y).astype(int)
         pos_all = max(int(y_all.sum()), 1)
@@ -9506,12 +9561,57 @@ def train_ml_payment_models(train_df: pd.DataFrame):
     else:
         best_pipe.fit(X, y)
     try:
-        best_pipe.ml_threshold_ = float(thresholds.get(best_name, 0.50))
+        base_thr = float(thresholds.get(best_name, 0.50))
+        best_pipe.ml_threshold_ = base_thr
+        best_pipe.ml_base_threshold_ = base_thr
         best_pipe.ml_model_name_ = str(best_name)
+        best_pipe.ml_fallback_best_name_ = str(fallback_best)
     except Exception:
         pass
     importance_df = _ml_feature_importance(best_pipe, numeric_cols, categorical_cols)
-    return best_pipe, perf_df.drop(columns=[c for c in ["_auc_rank", "_f1_rank", "_precision_rank"] if c in perf_df.columns], errors="ignore"), pd.DataFrame(confusion_rows), importance_df, ""
+    return best_pipe, perf_df, pd.DataFrame(confusion_rows), importance_df, pd.DataFrame(error_rows), ""
+
+
+def _ml_program_model_summary(train_df: pd.DataFrame) -> pd.DataFrame:
+    """Train separate program-level models and show their holdout performance.
+
+    This is diagnostic: live scoring continues to use the selected primary model
+    unless you later decide to route UG/PG scoring through separate models.
+    """
+    if train_df is None or train_df.empty or "Program" not in train_df.columns:
+        return pd.DataFrame()
+    rows = []
+    for program in sorted([p for p in train_df["Program"].dropna().astype(str).unique() if clean_text(p)]):
+        subset = train_df[train_df["Program"].astype(str).eq(program)].copy()
+        if subset.empty or subset["Actual Paid"].nunique() < 2 or subset["Actual Paid"].value_counts().min() < 5 or len(subset) < 40:
+            rows.append({"Program": program, "Status": "Not enough class balance for a reliable split", "Rows": int(len(subset)), "Converted": int(subset.get("Actual Paid", pd.Series(dtype=int)).sum())})
+            continue
+        _, perf, _, _, _, err = train_ml_payment_models(subset, preferred_model="Gradient Boosting")
+        if err or perf is None or perf.empty:
+            rows.append({"Program": program, "Status": err or "Model failed", "Rows": int(len(subset)), "Converted": int(subset["Actual Paid"].sum())})
+            continue
+        selected = perf[perf.get("Selected for Scoring", "").astype(str).eq("Yes")].copy()
+        if selected.empty:
+            selected = perf[perf["Model"].astype(str).eq("Gradient Boosting")].copy()
+        if selected.empty:
+            selected = perf.sort_values("F1", ascending=False).head(1).copy()
+        r = selected.iloc[0].to_dict()
+        rows.append({
+            "Program": program,
+            "Status": "OK",
+            "Selected Model": r.get("Model", ""),
+            "Rows": int(len(subset)),
+            "Converted": int(subset["Actual Paid"].sum()),
+            "Accuracy": r.get("Accuracy", np.nan),
+            "Balanced Accuracy": r.get("Balanced Accuracy", np.nan),
+            "Precision": r.get("Precision", np.nan),
+            "Recall": r.get("Recall", np.nan),
+            "F1": r.get("F1", np.nan),
+            "ROC AUC": r.get("ROC AUC", np.nan),
+            "Threshold": r.get("Threshold", np.nan),
+        })
+    return pd.DataFrame(rows)
+
 
 def _ml_feature_importance(pipe, numeric_cols, categorical_cols) -> pd.DataFrame:
     try:
@@ -9541,7 +9641,7 @@ def _ml_feature_importance(pipe, numeric_cols, categorical_cols) -> pd.DataFrame
         return pd.DataFrame()
 
 
-def score_ml_students(model, feature_df: pd.DataFrame) -> pd.DataFrame:
+def score_ml_students(model, feature_df: pd.DataFrame, threshold_mode: str = "Balanced") -> pd.DataFrame:
     if model is None or feature_df is None or feature_df.empty:
         return pd.DataFrame()
     numeric_cols, categorical_cols = _ml_feature_columns(feature_df)
@@ -9556,9 +9656,11 @@ def score_ml_students(model, feature_df: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         out["Payment Probability"] = model.predict(X)
     out["Payment Probability %"] = (out["Payment Probability"].astype(float) * 100).round(1)
-    threshold = float(getattr(model, "ml_threshold_", 0.50))
+    base_threshold = float(getattr(model, "ml_base_threshold_", getattr(model, "ml_threshold_", 0.50)))
+    threshold = _ml_threshold_for_mode(base_threshold, threshold_mode)
     out["Model Threshold"] = round(threshold, 3)
-    out["Predicted Conversion"] = np.where(out["Payment Probability"].astype(float) >= threshold, "Likely to Pay", "Needs Nurture")
+    out["Threshold Mode"] = threshold_mode
+    out["Predicted Conversion"] = out["Payment Probability"].map(lambda p: _ml_prediction_label(p, threshold))
     out["Prediction Band"] = out["Payment Probability"].map(_ml_probability_band)
     out["Top Factors"] = out.apply(_ml_student_reason, axis=1)
     return out.sort_values("Payment Probability", ascending=False).reset_index(drop=True)
@@ -9574,14 +9676,23 @@ def render_ml_predictions_page(data):
 
     with st.spinner("Building pre-payment feature set and training models..."):
         feature_df, train_df, event_intel_df, group_intel_df = build_ml_prediction_dataset(data)
-        model, perf_df, confusion_df, importance_df, err = train_ml_payment_models(train_df)
-        scored_df = score_ml_students(model, feature_df) if model is not None else pd.DataFrame()
+        model, perf_df, confusion_df, importance_df, error_audit_df, err = train_ml_payment_models(train_df, preferred_model="Gradient Boosting")
+        program_perf_df = _ml_program_model_summary(train_df)
 
     if feature_df.empty:
         st.warning("No student feature rows could be built from the current data.")
         return
     if err:
         st.warning(err)
+
+    threshold_mode = st.selectbox(
+        "Prediction threshold mode",
+        ["Balanced", "High Recall", "High Precision"],
+        index=0,
+        help="Balanced uses the tuned F1 threshold. High Recall lowers the threshold to catch more likely converters. High Precision raises the threshold to reduce false positives.",
+        key="ml_threshold_mode",
+    )
+    scored_df = score_ml_students(model, feature_df, threshold_mode=threshold_mode) if model is not None else pd.DataFrame()
 
     included = int(train_df.shape[0]) if train_df is not None else 0
     paid_rows = int(train_df["Actual Paid"].sum()) if train_df is not None and not train_df.empty else 0
@@ -9591,16 +9702,19 @@ def render_ml_predictions_page(data):
         pred_source["Prediction Band"] = "Not scored"
         pred_source["Payment Probability %"] = np.nan
 
+    primary_name = getattr(model, "ml_model_name_", "Gradient Boosting") if model is not None else "Not trained"
+    primary_threshold = float(getattr(model, "ml_base_threshold_", getattr(model, "ml_threshold_", 0.50))) if model is not None else 0.50
+    active_threshold = _ml_threshold_for_mode(primary_threshold, threshold_mode) if model is not None else 0.50
+
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Students Scored", f"{len(feature_df):,}")
-    m2.metric("Training Rows", f"{included:,}", delta=f"{paid_rows:,} paid")
+    m2.metric("Training Rows", f"{included:,}", delta=f"{paid_rows:,} converted")
     m3.metric("Refunds Included", f"{refund_included:,}")
     m4.metric("Current Conversion Rate", f"{(paid_rows / included * 100) if included else 0:.1f}%")
-    if model is not None:
-        st.caption(f"Selected scoring model: {getattr(model, 'ml_model_name_', 'Best train/test model')} · operating threshold: {getattr(model, 'ml_threshold_', 0.5):.3f}. Threshold is tuned on training predictions to improve F1/precision-recall balance on imbalanced conversion data.")
+    st.caption(f"Primary scoring model: {primary_name}. Balanced threshold: {primary_threshold:.3f}; active {threshold_mode} threshold: {active_threshold:.3f}. Gradient Boosting is used as the primary model when it trains successfully; other models remain visible for comparison.")
 
     st.markdown("### Prediction Bands")
-    band_order = ["High Intent", "Medium Intent", "Low Intent", "Not scored"]
+    band_order = ["Very High Intent", "High Intent", "Medium Intent", "Low Intent", "Cold", "Not scored"]
     band_df = pred_source.groupby("Prediction Band", as_index=False).size().rename(columns={"size": "Students"})
     band_df["Prediction Band"] = pd.Categorical(band_df["Prediction Band"], categories=band_order, ordered=True)
     band_df = band_df.sort_values("Prediction Band")
@@ -9609,23 +9723,28 @@ def render_ml_predictions_page(data):
         fig.update_traces(marker_color=GREEN_2, textposition="outside")
         st.plotly_chart(nice_layout(fig, height=330), use_container_width=True, key="ml_prediction_bands")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Student Predictions", "Model Performance", "Event Conversion", "Feature Importance", "Training Data Audit"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Student Predictions", "Model Performance", "Event Conversion", "Feature Importance", "Error Audit", "Training Data Audit"])
 
     with tab1:
         st.markdown("#### Student-level payment probability")
         if scored_df.empty:
             st.info("Student probability scoring is unavailable until a model is trained successfully.")
         else:
-            program_filter = st.multiselect("Program", sorted([x for x in scored_df["Program"].dropna().astype(str).unique() if x]), default=sorted([x for x in scored_df["Program"].dropna().astype(str).unique() if x]), key="ml_program_filter")
-            band_filter = st.multiselect("Prediction Band", ["High Intent", "Medium Intent", "Low Intent"], default=["High Intent", "Medium Intent", "Low Intent"], key="ml_band_filter")
+            program_values = sorted([x for x in scored_df["Program"].dropna().astype(str).unique() if x]) if "Program" in scored_df.columns else []
+            program_filter = st.multiselect("Program", program_values, default=program_values, key="ml_program_filter")
+            band_values = ["Very High Intent", "High Intent", "Medium Intent", "Low Intent", "Cold"]
+            band_filter = st.multiselect("Prediction Band", band_values, default=band_values, key="ml_band_filter")
+            conversion_filter = st.multiselect("Predicted Conversion", ["Likely to Pay", "Needs Nurture"], default=["Likely to Pay", "Needs Nurture"], key="ml_conversion_filter")
             show_df = scored_df.copy()
-            if program_filter:
+            if program_filter and "Program" in show_df.columns:
                 show_df = show_df[show_df["Program"].astype(str).isin(program_filter)]
-            if band_filter:
+            if band_filter and "Prediction Band" in show_df.columns:
                 show_df = show_df[show_df["Prediction Band"].astype(str).isin(band_filter)]
+            if conversion_filter and "Predicted Conversion" in show_df.columns:
+                show_df = show_df[show_df["Predicted Conversion"].astype(str).isin(conversion_filter)]
             cols = [c for c in [
                 "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Community Acquired",
-                "Payment Probability %", "Prediction Band", "Predicted Conversion", "Model Threshold", "Actual Paid", "total_touchpoints", "online_masterclass_count",
+                "Payment Probability %", "Prediction Band", "Predicted Conversion", "Threshold Mode", "Model Threshold", "Actual Paid", "total_touchpoints", "online_masterclass_count",
                 "competition_count", "general_fun_count", "winner_spotlight_count", "Top Factors", "Offered Date", "Observation Cutoff"
             ] if c in show_df.columns]
             display = show_df[cols].copy()
@@ -9647,6 +9766,12 @@ def render_ml_predictions_page(data):
         if confusion_df is not None and not confusion_df.empty:
             st.markdown("#### Confusion matrix by model")
             st.dataframe(confusion_df, use_container_width=True, hide_index=True, key="ml_confusion_table")
+        st.markdown("#### Separate UG / PG model diagnostic")
+        st.caption("This trains program-level diagnostic models separately. Use this to check whether UG and PG behave differently before deciding to route live scoring through separate models.")
+        if program_perf_df is not None and not program_perf_df.empty:
+            st.dataframe(program_perf_df, use_container_width=True, hide_index=True, key="ml_program_perf_table")
+        else:
+            st.info("Program-level model performance is unavailable.")
 
     with tab3:
         st.markdown("#### Event conversion intelligence")
@@ -9686,6 +9811,23 @@ def render_ml_predictions_page(data):
             st.info("Feature importance is unavailable for the selected model.")
 
     with tab5:
+        st.markdown("#### False positive / false negative audit")
+        st.caption("These are held-out test rows where the model prediction differed from the actual conversion label. Use this to understand confusing patterns and refine features.")
+        if error_audit_df is not None and not error_audit_df.empty:
+            model_values = sorted(error_audit_df["Model"].dropna().astype(str).unique())
+            default_model = [primary_name] if primary_name in model_values else model_values
+            model_filter = st.multiselect("Model", model_values, default=default_model, key="ml_error_model_filter")
+            error_filter = st.multiselect("Error Type", ["False Positive", "False Negative"], default=["False Positive", "False Negative"], key="ml_error_type_filter")
+            e_show = error_audit_df.copy()
+            if model_filter:
+                e_show = e_show[e_show["Model"].astype(str).isin(model_filter)]
+            if error_filter:
+                e_show = e_show[e_show["Error Type"].astype(str).isin(error_filter)]
+            st.dataframe(e_show.sort_values("Payment Probability %", ascending=False), use_container_width=True, height=560, hide_index=True, key="ml_error_audit_table")
+        else:
+            st.info("No held-out prediction errors available, or model training did not complete.")
+
+    with tab6:
         st.markdown("#### Training feature dataset audit")
         st.caption("Refund rows are included as converted because they paid once. Behavior columns are still built only up to payment date for converted students and first-30-days cutoff for non-converted students.")
         audit_cols = [c for c in [
