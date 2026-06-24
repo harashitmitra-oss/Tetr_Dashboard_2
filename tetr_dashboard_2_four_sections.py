@@ -9060,9 +9060,9 @@ def _ml_student_reason(row: pd.Series) -> str:
         pd_tp = int(row.get("post_deadline_touchpoints", 0) or 0)
         pd_meaningful = int(row.get("post_deadline_meaningful_touchpoints", 0) or 0)
         if gap != 999:
-            reasons.append(f"separate reactivation note: reactivated {gap} day{'s' if gap != 1 else ''} after deadline with {pd_tp} late touchpoint{'s' if pd_tp != 1 else ''}")
+            reasons.append(f"late-intent signal: reactivated {gap} day{'s' if gap != 1 else ''} after deadline with {pd_tp} late touchpoint{'s' if pd_tp != 1 else ''}")
         if pd_meaningful > 0:
-            reasons.append(f"separate late-interest note: {pd_meaningful} meaningful post-deadline touchpoint{'s' if pd_meaningful != 1 else ''}")
+            reasons.append(f"late-interest signal: {pd_meaningful} meaningful post-deadline touchpoint{'s' if pd_meaningful != 1 else ''}")
 
     group_map = _ml_event_group_feature_map()
     hit_groups = []
@@ -9242,11 +9242,12 @@ def _ml_winner_count_until(data: dict, email: str, student_key: str, student_nam
 def build_ml_prediction_dataset(data: dict, progress_callback=None):
     """Build payment-prediction features with strict journey-safe windows.
 
-    Main payment prediction uses the structured offer-to-deadline journey only.
-    Converted rows are also capped before payment date so no post-payment behavior
-    leaks into training. Unpaid rows are capped at their deadline / first-30-day
-    journey, and post-deadline reactivation is calculated separately for the
-    reactivation tab rather than being used as a direct model feature.
+    Main payment prediction uses the structured offer-to-deadline journey plus
+    payment-safe late-intent/reactivation signals. Converted rows are always
+    capped before payment date so no post-payment behavior leaks into training.
+    Unpaid rows use the offered-to-deadline journey plus currently observed
+    post-deadline reactivation features; these are shown separately and also
+    used as current late-intent signals for prediction.
 
     Refund rows are included as converted because they paid at least once; refund
     risk will be modeled separately later.
@@ -9311,23 +9312,33 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None):
     rows = []
     event_rows = []
     fixed_groups = _ml_event_group_feature_map()
+    dates_df = data.get("dates_df", pd.DataFrame()) if isinstance(data, dict) else pd.DataFrame()
 
     total_base_rows = int(len(base))
     progress_step = max(1, total_base_rows // 20) if total_base_rows else 1
-    _ml_progress(progress_callback, 24, f"Building offered-to-deadline payment-safe features for {total_base_rows:,} offered students...")
+    _ml_progress(progress_callback, 24, f"Building journey + payment-safe late-intent features for {total_base_rows:,} offered students...")
 
     for pos, (idx, r) in enumerate(base.iterrows(), start=1):
         if pos == 1 or pos == total_base_rows or pos % progress_step == 0:
             pct = 24 + int(31 * (pos / max(total_base_rows, 1)))
-            _ml_progress(progress_callback, pct, f"Building journey-window feature set and separate reactivation signals... {pos:,}/{total_base_rows:,} students processed")
+            _ml_progress(progress_callback, pct, f"Building journey-window features and safe post-deadline reactivation signals... {pos:,}/{total_base_rows:,} students processed")
         sid = clean_text(r.get("student_id", ""))
         email = clean_text(r.get("email_key", ""))
         skey = clean_text(r.get("student_key", "")) or normalize_name(r.get("student_name", ""))
         name = clean_text(r.get("student_name", ""))
         program = clean_text(r.get("Program", "")) or clean_text(r.get("UG/PG", ""))
         batch = clean_text(r.get("Batch", ""))
+        # Dates sheet is the source of truth for Course and the 30-day journey window.
+        drow = find_student_dates_row(dates_df, name, email, skey, program, batch) if dates_df is not None and not dates_df.empty else None
         offered_dt = pd.to_datetime(r.get("offered_date_parsed", pd.NaT), errors="coerce")
         deadline_dt = pd.to_datetime(r.get("deadline_parsed", pd.NaT), errors="coerce")
+        if drow is not None:
+            d_offered = pd.to_datetime(drow.get("offered_date_parsed", pd.NaT), errors="coerce")
+            d_deadline = pd.to_datetime(drow.get("deadline_parsed", pd.NaT), errors="coerce")
+            if pd.isna(offered_dt) and pd.notna(d_offered):
+                offered_dt = d_offered
+            if pd.isna(deadline_dt) and pd.notna(d_deadline):
+                deadline_dt = d_deadline
         payment_dt = _ml_resolve_payment_date(r, payment_lookup)
         is_paid = bool(paid_mask.loc[idx]) if idx in paid_mask.index else False
         is_refund = bool(refund_mask.loc[idx]) if idx in refund_mask.index else False
@@ -9345,20 +9356,20 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None):
         # For converted students, also cap before payment date to prevent leakage.
         journey_end_dt = first30_end
         cutoff_dt = journey_end_dt
-        observation_scope = "Unpaid · offered-to-deadline journey"
+        observation_scope = "Unpaid · journey + current late intent"
         if is_paid and pd.notna(payment_dt):
             pre_payment_cutoff = payment_dt - pd.Timedelta(days=1)
             if pd.notna(journey_end_dt):
                 cutoff_dt = min(journey_end_dt, pre_payment_cutoff)
             else:
                 cutoff_dt = pre_payment_cutoff
-            observation_scope = "Converted · offered-to-deadline before payment"
+            observation_scope = "Converted · journey + late intent before payment"
         elif is_paid:
             cutoff_dt = journey_end_dt
-            observation_scope = "Converted · offered-to-deadline fallback"
+            observation_scope = "Converted · journey fallback"
         else:
             cutoff_dt = journey_end_dt
-            observation_scope = "Unpaid · offered-to-deadline journey"
+            observation_scope = "Unpaid · journey + current late intent"
 
         match_indices = set()
         for k in [sid, email, skey, normalize_name(name)]:
@@ -9390,11 +9401,19 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None):
             if not ev.empty:
                 ev = ev.drop_duplicates(subset=["event_identity_key"]).copy()
 
-        bucket_counts = ev["event_bucket"].value_counts().astype(int).to_dict() if not ev.empty and "event_bucket" in ev.columns else {}
-        group_counts = ev["event_group"].value_counts().astype(int).to_dict() if not ev.empty and "event_group" in ev.columns else {}
-        event_dates = pd.to_datetime(ev["event_date"], errors="coerce") if not ev.empty else pd.Series([], dtype="datetime64[ns]")
+        # Model core window = offer-to-deadline; late/reactivation features are derived
+        # from ev_all, which is still payment-safe because converted rows are capped
+        # before payment and unpaid rows represent currently observed behavior.
+        model_ev = ev.copy()
+        late_ev = pd.DataFrame()
+        if not ev_all.empty and pd.notna(deadline_dt):
+            late_ev = ev_all[pd.to_datetime(ev_all.get("event_date", pd.NaT), errors="coerce").dt.normalize().gt(deadline_dt)].copy()
+        bucket_counts = model_ev["event_bucket"].value_counts().astype(int).to_dict() if not model_ev.empty and "event_bucket" in model_ev.columns else {}
+        group_counts = model_ev["event_group"].value_counts().astype(int).to_dict() if not model_ev.empty and "event_group" in model_ev.columns else {}
+        late_group_counts = late_ev["event_group"].value_counts().astype(int).to_dict() if not late_ev.empty and "event_group" in late_ev.columns else {}
+        event_dates = pd.to_datetime(model_ev["event_date"], errors="coerce") if not model_ev.empty else pd.Series([], dtype="datetime64[ns]")
         active_days = int(event_dates.dropna().dt.normalize().nunique()) if not event_dates.empty else 0
-        total_touchpoints = int(len(ev)) if not ev.empty else 0
+        total_touchpoints = int(len(model_ev)) if not model_ev.empty else 0
         if pd.notna(offered_dt) and not event_dates.empty and event_dates.notna().any():
             days_from_offer = (event_dates.dropna().dt.normalize() - offered_dt).dt.days
             first_activity_day = int(days_from_offer.min()) if not days_from_offer.empty else 999
@@ -9447,7 +9466,9 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None):
 
         country = clean_text(r.get(country_col, "")) if country_col else ""
         income = clean_text(r.get(income_col, "")) if income_col else ""
-        course = clean_text(r.get(course_col, "")) if course_col else ""
+        course_from_base = clean_text(r.get(course_col, "")) if course_col else ""
+        course_from_dates = clean_text(drow.get("Course", "")) if drow is not None else ""
+        course = course_from_dates or course_from_base
         attrs = attr_lookup.get(email, {}) or attr_lookup.get(skey, {}) or attr_lookup.get(sid, {}) or {}
         country = country or attrs.get("country", "")
         income = income or attrs.get("income", "")
@@ -9506,8 +9527,12 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None):
             "missing_offered_date": int(pd.isna(offered_dt)),
         }
         for group_name, col in fixed_groups.items():
-            row[col] = int(group_counts.get(group_name, 0))
-            row[col.replace("count", "attended")] = int(group_counts.get(group_name, 0) > 0)
+            core_count = int(group_counts.get(group_name, 0))
+            late_count = int(late_group_counts.get(group_name, 0))
+            row[col] = core_count
+            row[col.replace("count", "attended")] = int(core_count > 0)
+            row[f"post_deadline_{col}"] = late_count
+            row[f"post_deadline_{col.replace('count', 'attended')}"] = int(late_count > 0)
 
         meaningful_touchpoints = int(row["online_masterclass_count"] + row["competition_count"] + row["winner_spotlight_count"])
         observation_days = 0
@@ -9526,6 +9551,8 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None):
         row["post_deadline_share"] = round(row["post_deadline_touchpoints"] / max(row["first30_touchpoints"] + row["post_deadline_touchpoints"], 1), 4) if row["post_deadline_touchpoints"] else 0.0
         row["active_after_deadline_only"] = int(row["post_deadline_touchpoints"] > 0 and row["first30_touchpoints"] == 0)
         row["reactivation_quality_signal"] = int(row["post_deadline_meaningful_touchpoints"] > 0)
+        row["safe_total_touchpoints_including_late"] = int(row["total_touchpoints"] + row["post_deadline_touchpoints"])
+        row["safe_meaningful_touchpoints_including_late"] = int(row["meaningful_touchpoints"] + row["post_deadline_meaningful_touchpoints"])
         row["general_only"] = int(total_touchpoints > 0 and row["general_fun_count"] == total_touchpoints and row["winner_spotlight_count"] == 0)
         row["no_activity_in_community"] = int(community_acquired and total_touchpoints == 0)
         row["active_out_community"] = int((not community_acquired) and total_touchpoints > 0)
@@ -9538,8 +9565,11 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None):
         row["Top Factors"] = _ml_student_reason(pd.Series(row))
         rows.append(row)
 
-        if not ev.empty:
-            for _, er in ev.iterrows():
+        # Event intelligence should consider every payment-safe attended event, including
+        # post-deadline events that happened before payment or current unpaid late activity.
+        ev_for_intel = ev_all.copy() if not ev_all.empty else model_ev.copy()
+        if not ev_for_intel.empty:
+            for _, er in ev_for_intel.iterrows():
                 event_rows.append({
                     "student_id": sid,
                     "event_name": clean_text(er.get("event_name", "")),
@@ -9698,10 +9728,22 @@ def _ml_feature_columns(df: pd.DataFrame):
         "no_activity_in_community", "active_out_community", "activated_week1",
         "activated_week2", "activated_first30", "early_meaningful_activity",
         "high_quality_signal", "low_quality_activity_only",
+        "post_deadline_touchpoints", "post_deadline_active_days", "reactivated_after_deadline",
+        "reactivation_gap_days", "last_post_deadline_activity_day",
+        "post_deadline_online_masterclass_count", "post_deadline_competition_count",
+        "post_deadline_general_fun_count", "post_deadline_meaningful_touchpoints",
+        "post_deadline_share", "active_after_deadline_only", "reactivation_quality_signal",
+        "safe_total_touchpoints_including_late", "safe_meaningful_touchpoints_including_late",
     ]
     # Include every stable repetitive event-group count/flag created by
     # _ml_event_group_feature_map(), plus future group features if added later.
-    group_numeric = [c for c in df.columns if str(c).startswith("group_count_") or str(c).startswith("group_attended_")]
+    group_numeric = [
+        c for c in df.columns
+        if str(c).startswith("group_count_")
+        or str(c).startswith("group_attended_")
+        or str(c).startswith("post_deadline_group_count_")
+        or str(c).startswith("post_deadline_group_attended_")
+    ]
     numeric_cols = [c for c in base_numeric + group_numeric if c in df.columns]
     # Preserve order while removing duplicates.
     numeric_cols = list(dict.fromkeys(numeric_cols))
@@ -10030,8 +10072,8 @@ def render_ml_predictions_page(data):
     st.subheader("Tetr ML Prediction Dashboard")
     st.caption(
         "Predicts payment/conversion probability from payment-safe behavior. "
-        "Main prediction uses the offered-to-deadline journey only. Converted students are also capped before payment; unpaid students are not allowed to use all-time activity. "
-        "Post-deadline reactivation is shown separately. Refunded students are included as converted because they paid once."
+        "Main prediction uses offered-to-deadline behavior plus payment-safe post-deadline reactivation signals. Converted students are capped before payment; unpaid students use currently observed late activity only as a separate late-intent signal. "
+        "Refunded students are included as converted because they paid once."
     )
 
     if not SKLEARN_AVAILABLE:
@@ -10365,7 +10407,7 @@ def render_ml_predictions_page(data):
 
     with tabs[8]:
         st.markdown("#### Training feature dataset audit")
-        st.caption("Refund rows are included as converted. Main model features use offer-to-deadline behavior only, capped before payment for converted students. Post-deadline reactivation is audited separately and not used as direct model input.")
+        st.caption("Refund rows are included as converted. Model features use offer-to-deadline behavior plus payment-safe late-intent/reactivation signals. Converted rows are capped before payment; unpaid rows use currently observed post-deadline activity as a separate signal. Refund rows are included as converted.")
         audit_cols = [c for c in [
             "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Income", "Counsellor", "Community Acquired",
             "Actual Paid", "Refund / Later Refunded", "training_included", "Offered Date", "Deadline", "Payment Date", "Observation Scope", "Observation Cutoff",
