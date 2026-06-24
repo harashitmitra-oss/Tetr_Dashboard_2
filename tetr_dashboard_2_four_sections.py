@@ -20,6 +20,19 @@ try:
 except Exception:
     GSPREAD_AVAILABLE = False
 
+
+try:
+    from sklearn.compose import ColumnTransformer
+    from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score, roc_auc_score
+    from sklearn.model_selection import train_test_split
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SKLEARN_AVAILABLE = False
+
 st.set_page_config(page_title="Tetr Analytics Dashboard", layout="wide")
 
 MASTER_SHEETS = ["Master UG", "Master PG"]
@@ -8786,13 +8799,805 @@ def render_community_impact_page(data):
     with tabs[2]:
         _render_community_impact_scope(cohort[cohort.get("UG/PG", pd.Series(dtype=str)).astype(str).str.upper().eq("PG")].copy() if not cohort.empty else cohort, "PG", "community_impact_pg")
 
+# ---------------- ML Predictions ----------------
+
+def _ml_event_group(event_name: str, event_type: str = "") -> str:
+    """Speaker/topic grouping for ML conversion intelligence."""
+    text = f"{clean_text(event_name)} {clean_text(event_type)}".lower()
+    if "pratham" in text:
+        return "Pratham Events"
+    if "garima" in text or "dr garima" in text:
+        return "Garima Events"
+    if "shahrose" in text or "visa" in text or "travel" in text:
+        return "Shahrose / Visa / Travel"
+    if "harshit" in text or "welcome webinar" in text or "welcome" in text:
+        return "Welcome / Harshit Events"
+    if "amitoj" in text:
+        return "Amitoj Events"
+    if "tarun" in text:
+        return "Tarun Events"
+    if any(k in text for k in ["ai", "voice agent", "automation", "agent"]):
+        return "AI / Automation Events"
+    if any(k in text for k in ["founder", "startup", "vc", "venture", "fund", "pitch", "tif", "innovation fund"]):
+        return "Founder / Startup / VC"
+    if any(k in text for k in ["career", "resume", "linkedin", "proof of work", "communication", "storytelling"]):
+        return "Career / Communication"
+    typ = _community_impact_event_bucket(event_type)
+    if typ == "Competition":
+        return "Competitions / Hackathons"
+    if typ == "General/Fun":
+        return "General / Fun"
+    if typ == "Online Events & Masterclasses":
+        return "Other Online / Masterclass"
+    return "Other"
+
+
+def _ml_region_from_country(country: str) -> str:
+    s = clean_text(country).lower()
+    if not s:
+        return "Unknown"
+    india = {"india", "in"}
+    mena = {"uae", "united arab emirates", "saudi arabia", "qatar", "kuwait", "oman", "bahrain", "egypt", "jordan", "lebanon", "morocco", "tunisia", "algeria", "iraq", "iran", "turkey"}
+    latam = {"mexico", "brazil", "argentina", "chile", "colombia", "peru", "ecuador", "venezuela", "bolivia", "uruguay", "paraguay", "costa rica", "panama", "guatemala", "dominican republic"}
+    sea = {"singapore", "malaysia", "indonesia", "thailand", "vietnam", "philippines", "cambodia", "myanmar", "laos", "brunei"}
+    eu = {"united kingdom", "uk", "germany", "france", "italy", "spain", "portugal", "netherlands", "belgium", "switzerland", "austria", "sweden", "norway", "denmark", "finland", "ireland", "poland", "lithuania"}
+    na = {"united states", "usa", "us", "canada"}
+    if s in india or "india" in s:
+        return "India"
+    if s in mena:
+        return "MENA"
+    if s in latam:
+        return "LATAM"
+    if s in sea:
+        return "SEA"
+    if s in eu:
+        return "EU/UK"
+    if s in na:
+        return "North America"
+    return "Other"
+
+
+def _ml_probability_band(prob: float) -> str:
+    try:
+        p = float(prob)
+    except Exception:
+        p = 0.0
+    if p >= 0.70:
+        return "High Intent"
+    if p >= 0.40:
+        return "Medium Intent"
+    return "Low Intent"
+
+
+def _ml_student_reason(row: pd.Series) -> str:
+    reasons = []
+    if bool(row.get("community_acquired", False)):
+        reasons.append("joined community")
+    else:
+        reasons.append("not in community")
+    total = int(row.get("total_touchpoints", 0) or 0)
+    if total > 0:
+        reasons.append(f"{total} pre-payment touchpoint{'s' if total != 1 else ''}")
+    else:
+        reasons.append("no pre-payment activity")
+    om = int(row.get("online_masterclass_count", 0) or 0)
+    comp = int(row.get("competition_count", 0) or 0)
+    gen = int(row.get("general_fun_count", 0) or 0)
+    if om:
+        reasons.append(f"{om} online/masterclass")
+    if comp:
+        reasons.append(f"{comp} competition/hackathon")
+    if gen and not (om or comp):
+        reasons.append(f"{gen} general/fun only")
+    if int(row.get("winner_spotlight_count", 0) or 0) > 0:
+        reasons.append("winner/spotlight signal")
+    group_bits = []
+    for label, col in [
+        ("Pratham", "group_count_pratham"),
+        ("Garima", "group_count_garima"),
+        ("Shahrose/Visa", "group_count_shahrose"),
+        ("AI", "group_count_ai"),
+        ("Founder/Startup", "group_count_founder"),
+        ("Career", "group_count_career"),
+    ]:
+        if int(row.get(col, 0) or 0) > 0:
+            group_bits.append(label)
+    if group_bits:
+        reasons.append("attended " + ", ".join(group_bits[:3]))
+    return "; ".join(reasons[:6])
+
+
+def _ml_tetrx_payment_lookup(data: dict) -> dict:
+    rows = []
+    activities = data.get("activities", {}) if isinstance(data, dict) else {}
+    for sheet in TX_SHEETS:
+        tx = activities.get(sheet, pd.DataFrame())
+        if tx is None or tx.empty:
+            continue
+        program = "UG" if sheet == "Tetr-X-UG" else "PG" if sheet == "Tetr-X-PG" else infer_program_from_sheet(sheet)
+        status = tx.get("sheet_status_raw", pd.Series("", index=tx.index)).astype(str).map(clean_text)
+        paid = pd.Series([is_paid_status_for_program(s, program) for s in status], index=tx.index).astype(bool)
+        pay = pd.to_datetime(tx.get("payment_date_parsed", pd.NaT), errors="coerce")
+        frame = pd.DataFrame({
+            "program": program,
+            "email_key": tx.get("email_key", ""),
+            "student_key": tx.get("student_key", ""),
+            "student_name": tx.get("student_name", ""),
+            "payment_date": pay,
+            "is_paid": paid,
+        })
+        frame["email_key"] = frame["email_key"].astype(str).map(clean_text)
+        frame["student_key"] = frame["student_key"].astype(str).map(clean_text)
+        frame["student_name_key"] = frame["student_name"].astype(str).map(normalize_name)
+        frame = frame[frame["is_paid"] & frame["payment_date"].notna()].copy()
+        if not frame.empty:
+            rows.append(frame)
+    if not rows:
+        return {"by_email": {}, "by_name": {}, "by_email_any": {}, "by_name_any": {}}
+    lookup_df = pd.concat(rows, ignore_index=True).sort_values("payment_date")
+    out = {"by_email": {}, "by_name": {}, "by_email_any": {}, "by_name_any": {}}
+    for _, r in lookup_df.iterrows():
+        prog = clean_text(r.get("program", ""))
+        email = clean_text(r.get("email_key", ""))
+        name = clean_text(r.get("student_key", "")) or clean_text(r.get("student_name_key", ""))
+        dt = pd.to_datetime(r.get("payment_date", pd.NaT), errors="coerce")
+        if pd.isna(dt):
+            continue
+        if email:
+            out["by_email"].setdefault((prog, email), dt)
+            out["by_email_any"].setdefault(email, dt)
+        if name:
+            out["by_name"].setdefault((prog, name), dt)
+            out["by_name_any"].setdefault(name, dt)
+    return out
+
+
+def _ml_resolve_payment_date(row: pd.Series, lookup: dict):
+    program = clean_text(row.get("Program", ""))
+    email = clean_text(row.get("email_key", ""))
+    name = clean_text(row.get("student_key", "")) or normalize_name(row.get("student_name", ""))
+    for bucket, key in [
+        ("by_email", (program, email)),
+        ("by_name", (program, name)),
+    ]:
+        if key[1] and key in lookup.get(bucket, {}):
+            return lookup[bucket][key]
+    if email and email in lookup.get("by_email_any", {}):
+        return lookup["by_email_any"][email]
+    if name and name in lookup.get("by_name_any", {}):
+        return lookup["by_name_any"][name]
+    fallback = pd.to_datetime(row.get("resolved_payment_date", row.get("master_payment_date_parsed", pd.NaT)), errors="coerce")
+    return fallback if pd.notna(fallback) else pd.NaT
+
+
+def _ml_attr_lookup_from_activities(data: dict) -> dict:
+    """Look up country/income/counsellor from batch/Tetr-X rows when missing in master."""
+    out = {}
+    activities = data.get("activities", {}) if isinstance(data, dict) else {}
+    for _, df in activities.items():
+        if df is None or df.empty:
+            continue
+        for _, r in df.iterrows():
+            keys = [clean_text(r.get("email_key", "")), clean_text(r.get("student_key", "")) or normalize_name(r.get("student_name", ""))]
+            attrs = {
+                "country": clean_text(r.get("country", "")),
+                "income": clean_text(r.get("income", "")),
+                "counsellor": clean_text(r.get("counsellor_name", "")),
+            }
+            if not any(attrs.values()):
+                continue
+            for k in [x for x in keys if x]:
+                prev = out.get(k, {})
+                out[k] = {kk: prev.get(kk) or vv for kk, vv in attrs.items()}
+    return out
+
+
+def _ml_winner_count_until(data: dict, email: str, student_key: str, student_name: str, cutoff_dt) -> int:
+    winner_df = data.get("winner_df", pd.DataFrame()) if isinstance(data, dict) else pd.DataFrame()
+    if winner_df is None or winner_df.empty:
+        return 0
+    w = winner_df.copy()
+    kind_mask = pd.Series(False, index=w.index)
+    if "is_winner" in w.columns:
+        kind_mask = kind_mask | w["is_winner"].fillna(False).astype(bool)
+    if "is_spotlight" in w.columns:
+        kind_mask = kind_mask | w["is_spotlight"].fillna(False).astype(bool)
+    if kind_mask.any():
+        w = w.loc[kind_mask].copy()
+    if w.empty:
+        return 0
+    mask = pd.Series(False, index=w.index)
+    email = clean_text(email)
+    skey = clean_text(student_key) or normalize_name(student_name)
+    if email and "email_key" in w.columns:
+        mask = mask | w["email_key"].astype(str).map(clean_text).eq(email)
+    if skey and "student_key" in w.columns:
+        mask = mask | w["student_key"].astype(str).map(clean_text).eq(skey)
+    w = w.loc[mask].copy()
+    if w.empty:
+        return 0
+    cutoff_dt = pd.to_datetime(cutoff_dt, errors="coerce")
+    if pd.notna(cutoff_dt) and "announcement_date" in w.columns:
+        ann = pd.to_datetime(w["announcement_date"], errors="coerce")
+        w = w.loc[ann.notna() & ann.le(cutoff_dt.normalize())].copy()
+    if w.empty:
+        return 0
+    return int(w.drop_duplicates(subset=[c for c in ["challenge_name", "announcement_date", "entry_type"] if c in w.columns]).shape[0])
+
+
+def build_ml_prediction_dataset(data: dict):
+    """Build payment-prediction features from pre-payment behavior only.
+
+    Paid rows use activities before payment date. Unpaid rows use the first 30 days
+    from offer/deadline. Refund rows are excluded from training for this payment model
+    because refund risk will be modeled separately later.
+    """
+    overview_df = data.get("overview_df", pd.DataFrame()) if isinstance(data, dict) else pd.DataFrame()
+    if overview_df is None or overview_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    base = overview_df.copy()
+    base["student_id"] = base.apply(lambda r: clean_text(r.get("email_key", "")) or clean_text(r.get("student_key", "")) or normalize_name(r.get("student_name", "")), axis=1)
+    base = base[base["student_id"].astype(str).str.len() > 0].copy()
+    base = base.drop_duplicates(subset=["student_id"], keep="first")
+
+    country_col = best_matching_col(base, ["country"])
+    income_col = best_matching_col(base, ["income"])
+    course_col = best_matching_col(base, ["course"])
+    attr_lookup = _ml_attr_lookup_from_activities(data)
+    payment_lookup = _ml_tetrx_payment_lookup(data)
+
+    comm_series = base.get("admitted_group_batch_onwards_raw", base.get("community_status_value", pd.Series("", index=base.index))).astype(str)
+    def _joined(x):
+        s = clean_text(x).strip().lower().replace("-", " ")
+        s = " ".join(s.split())
+        return s in {"in", "tetrx", "tetr x", "added to term 0", "left"}
+
+    status_source = base.get("resolved_status", base.get("master_status_value", pd.Series("", index=base.index))).astype(str).map(clean_text)
+    program_series = base.get("Program", pd.Series("", index=base.index)).astype(str)
+    refund_mask = status_source.str.lower().str.contains("refund", na=False) | base.get("is_refunded", pd.Series(False, index=base.index)).fillna(False).astype(bool)
+    paid_mask = pd.Series([is_paid_status_for_program(s, p) for s, p in zip(status_source, program_series)], index=base.index).astype(bool) & (~refund_mask)
+
+    activity_index = data.get("all_time_student_activity_index", pd.DataFrame()) if isinstance(data, dict) else pd.DataFrame()
+    if activity_index is not None and not activity_index.empty:
+        aidx = activity_index.copy()
+        aidx["event_date"] = pd.to_datetime(aidx.get("event_date", pd.NaT), errors="coerce").dt.normalize()
+        if "event_bucket" not in aidx.columns:
+            aidx["event_bucket"] = aidx.get("event_type", pd.Series("", index=aidx.index)).map(_community_impact_event_bucket)
+        aidx["event_group"] = aidx.apply(lambda r: _ml_event_group(r.get("event_name", ""), r.get("event_type", "")), axis=1)
+        aidx["event_identity_key"] = (
+            aidx.get("event_name", pd.Series("", index=aidx.index)).astype(str).map(normalize_name)
+            + "|" + aidx.get("event_type", pd.Series("", index=aidx.index)).astype(str).map(normalize_name)
+            + "|" + aidx["event_date"].dt.strftime("%Y-%m-%d").fillna("undated")
+        )
+        key_to_indices = {}
+        for idx, ar in aidx.iterrows():
+            keys = {
+                clean_text(ar.get("student_id", "")),
+                clean_text(ar.get("email_key", "")),
+                clean_text(ar.get("student_key", "")),
+                normalize_name(ar.get("student_name", "")),
+            }
+            for k in [x for x in keys if x]:
+                key_to_indices.setdefault(k, []).append(idx)
+    else:
+        aidx = pd.DataFrame()
+        key_to_indices = {}
+
+    rows = []
+    event_rows = []
+    fixed_groups = {
+        "Pratham Events": "group_count_pratham",
+        "Garima Events": "group_count_garima",
+        "Shahrose / Visa / Travel": "group_count_shahrose",
+        "Welcome / Harshit Events": "group_count_welcome",
+        "AI / Automation Events": "group_count_ai",
+        "Founder / Startup / VC": "group_count_founder",
+        "Career / Communication": "group_count_career",
+        "Competitions / Hackathons": "group_count_competitions_group",
+        "General / Fun": "group_count_general_fun_group",
+    }
+
+    for idx, r in base.iterrows():
+        sid = clean_text(r.get("student_id", ""))
+        email = clean_text(r.get("email_key", ""))
+        skey = clean_text(r.get("student_key", "")) or normalize_name(r.get("student_name", ""))
+        name = clean_text(r.get("student_name", ""))
+        program = clean_text(r.get("Program", "")) or clean_text(r.get("UG/PG", ""))
+        batch = clean_text(r.get("Batch", ""))
+        offered_dt = pd.to_datetime(r.get("offered_date_parsed", pd.NaT), errors="coerce")
+        deadline_dt = pd.to_datetime(r.get("deadline_parsed", pd.NaT), errors="coerce")
+        payment_dt = _ml_resolve_payment_date(r, payment_lookup)
+        is_paid = bool(paid_mask.loc[idx]) if idx in paid_mask.index else False
+        is_refund = bool(refund_mask.loc[idx]) if idx in refund_mask.index else False
+
+        if pd.notna(offered_dt):
+            offered_dt = offered_dt.normalize()
+        if pd.notna(deadline_dt):
+            deadline_dt = deadline_dt.normalize()
+        if pd.notna(payment_dt):
+            payment_dt = payment_dt.normalize()
+        first30_end = pd.NaT
+        if pd.notna(offered_dt):
+            first30_end = deadline_dt if pd.notna(deadline_dt) else offered_dt + pd.Timedelta(days=30)
+        cutoff_dt = pd.NaT
+        if is_paid and pd.notna(payment_dt):
+            cutoff_dt = payment_dt - pd.Timedelta(days=1)
+            if pd.notna(first30_end):
+                cutoff_dt = min(cutoff_dt, first30_end)
+        elif pd.notna(first30_end):
+            cutoff_dt = first30_end
+
+        match_indices = set()
+        for k in [sid, email, skey, normalize_name(name)]:
+            if k and k in key_to_indices:
+                match_indices.update(key_to_indices[k])
+        ev = pd.DataFrame()
+        if match_indices and not aidx.empty:
+            ev = aidx.loc[list(match_indices)].copy()
+            ev = ev[ev["event_date"].notna()].copy()
+            if pd.notna(offered_dt):
+                ev = ev[ev["event_date"].ge(offered_dt)].copy()
+            elif not is_paid:
+                ev = ev.iloc[0:0].copy()
+            if pd.notna(cutoff_dt):
+                ev = ev[ev["event_date"].le(cutoff_dt)].copy()
+            if is_paid and pd.notna(payment_dt):
+                ev = ev[ev["event_date"].lt(payment_dt)].copy()
+            if not ev.empty:
+                ev = ev.drop_duplicates(subset=["event_identity_key"]).copy()
+
+        bucket_counts = ev["event_bucket"].value_counts().astype(int).to_dict() if not ev.empty and "event_bucket" in ev.columns else {}
+        group_counts = ev["event_group"].value_counts().astype(int).to_dict() if not ev.empty and "event_group" in ev.columns else {}
+        event_dates = pd.to_datetime(ev["event_date"], errors="coerce") if not ev.empty else pd.Series([], dtype="datetime64[ns]")
+        active_days = int(event_dates.dropna().dt.normalize().nunique()) if not event_dates.empty else 0
+        total_touchpoints = int(len(ev)) if not ev.empty else 0
+        if pd.notna(offered_dt) and not event_dates.empty and event_dates.notna().any():
+            days_from_offer = (event_dates.dropna().dt.normalize() - offered_dt).dt.days
+            first_activity_day = int(days_from_offer.min()) if not days_from_offer.empty else 999
+            last_activity_day = int(days_from_offer.max()) if not days_from_offer.empty else 999
+            week1 = int(days_from_offer.between(0, 6, inclusive="both").sum())
+            week2 = int(days_from_offer.between(7, 13, inclusive="both").sum())
+            week3 = int(days_from_offer.between(14, 20, inclusive="both").sum())
+            week4 = int(days_from_offer.between(21, 30, inclusive="both").sum())
+        else:
+            first_activity_day = 999
+            last_activity_day = 999
+            week1 = week2 = week3 = week4 = 0
+
+        country = clean_text(r.get(country_col, "")) if country_col else ""
+        income = clean_text(r.get(income_col, "")) if income_col else ""
+        course = clean_text(r.get(course_col, "")) if course_col else ""
+        attrs = attr_lookup.get(email, {}) or attr_lookup.get(skey, {}) or attr_lookup.get(sid, {}) or {}
+        country = country or attrs.get("country", "")
+        income = income or attrs.get("income", "")
+        counsellor = clean_text(r.get("counsellor_name", "")) or attrs.get("counsellor", "")
+        community_acquired = bool(_joined(comm_series.loc[idx])) if idx in comm_series.index else False
+        winner_count = _ml_winner_count_until(data, email, skey, name, cutoff_dt)
+
+        row = {
+            "student_id": sid,
+            "Name": name,
+            "Email": email,
+            "Program": program,
+            "Batch": batch,
+            "Course": course or "Unknown",
+            "Country": country or "Unknown",
+            "Region": _ml_region_from_country(country),
+            "Income": income or "Unknown",
+            "Counsellor": counsellor or "Unknown",
+            "Community Acquired": "Yes" if community_acquired else "No",
+            "community_acquired": int(community_acquired),
+            "Offered Date": offered_dt,
+            "Deadline": deadline_dt,
+            "Payment Date": payment_dt,
+            "Observation Cutoff": cutoff_dt,
+            "Actual Paid": int(is_paid),
+            "Refund Excluded": int(is_refund),
+            "training_included": int(not is_refund),
+            "total_touchpoints": total_touchpoints,
+            "active_days": active_days,
+            "first_activity_day": first_activity_day,
+            "last_activity_day": last_activity_day,
+            "touchpoints_week1": week1,
+            "touchpoints_week2": week2,
+            "touchpoints_week3": week3,
+            "touchpoints_week4": week4,
+            "online_masterclass_count": int(bucket_counts.get("Online Events & Masterclasses", 0)),
+            "competition_count": int(bucket_counts.get("Competition", 0)),
+            "general_fun_count": int(bucket_counts.get("General/Fun", 0)),
+            "other_count": int(sum(v for k, v in bucket_counts.items() if k not in {"Online Events & Masterclasses", "Competition", "General/Fun"})),
+            "winner_spotlight_count": int(winner_count),
+            "has_activity": int(total_touchpoints > 0),
+            "has_online_masterclass": int(bucket_counts.get("Online Events & Masterclasses", 0) > 0),
+            "has_competition": int(bucket_counts.get("Competition", 0) > 0),
+            "has_winner_spotlight": int(winner_count > 0),
+            "missing_offered_date": int(pd.isna(offered_dt)),
+        }
+        for group_name, col in fixed_groups.items():
+            row[col] = int(group_counts.get(group_name, 0))
+            row[col.replace("count", "attended")] = int(group_counts.get(group_name, 0) > 0)
+        row["Top Factors"] = _ml_student_reason(pd.Series(row))
+        rows.append(row)
+
+        if not ev.empty:
+            for _, er in ev.iterrows():
+                event_rows.append({
+                    "student_id": sid,
+                    "event_name": clean_text(er.get("event_name", "")),
+                    "event_type": clean_text(er.get("event_type", "")),
+                    "event_bucket": clean_text(er.get("event_bucket", "")),
+                    "event_group": clean_text(er.get("event_group", "")),
+                    "event_date": er.get("event_date", pd.NaT),
+                    "Actual Paid": int(is_paid),
+                    "training_included": int(not is_refund),
+                })
+
+    feature_df = pd.DataFrame(rows)
+    event_rows_df = pd.DataFrame(event_rows)
+    if feature_df.empty:
+        return feature_df, pd.DataFrame(), pd.DataFrame(), event_rows_df
+
+    train_df = feature_df[feature_df["training_included"].eq(1)].copy()
+    event_intel_df = build_ml_event_conversion_intelligence(train_df, event_rows_df)
+    group_intel_df = build_ml_group_conversion_intelligence(train_df, event_rows_df)
+    return feature_df, train_df, event_intel_df, group_intel_df
+
+
+def build_ml_event_conversion_intelligence(train_df: pd.DataFrame, event_rows_df: pd.DataFrame) -> pd.DataFrame:
+    if train_df is None or train_df.empty or event_rows_df is None or event_rows_df.empty:
+        return pd.DataFrame(columns=["Event", "Event Group", "Event Type", "Attended Students", "Paid Students", "Conversion %", "Non-Attendee Conversion %", "Lift (pp)"])
+    train_ids = set(train_df["student_id"].astype(str))
+    y = train_df.set_index("student_id")["Actual Paid"].astype(int).to_dict()
+    ev = event_rows_df[event_rows_df["student_id"].astype(str).isin(train_ids)].copy()
+    ev = ev.drop_duplicates(subset=["student_id", "event_name", "event_type", "event_date"])
+    rows = []
+    all_paid = np.array([int(y.get(s, 0)) for s in train_ids])
+    for (name, group, typ), part in ev.groupby(["event_name", "event_group", "event_type"], dropna=False):
+        attendees = set(part["student_id"].astype(str))
+        if not attendees:
+            continue
+        paid_att = sum(int(y.get(s, 0)) for s in attendees)
+        non = train_ids - attendees
+        paid_non = sum(int(y.get(s, 0)) for s in non)
+        conv = (paid_att / len(attendees) * 100.0) if attendees else 0.0
+        non_conv = (paid_non / len(non) * 100.0) if non else 0.0
+        rows.append({
+            "Event": clean_text(name),
+            "Event Group": clean_text(group),
+            "Event Type": clean_text(typ),
+            "Attended Students": int(len(attendees)),
+            "Paid Students": int(paid_att),
+            "Conversion %": round(conv, 1),
+            "Non-Attendee Conversion %": round(non_conv, 1),
+            "Lift (pp)": round(conv - non_conv, 1),
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["Lift (pp)", "Attended Students"], ascending=[False, False]).reset_index(drop=True)
+
+
+def build_ml_group_conversion_intelligence(train_df: pd.DataFrame, event_rows_df: pd.DataFrame) -> pd.DataFrame:
+    if train_df is None or train_df.empty or event_rows_df is None or event_rows_df.empty:
+        return pd.DataFrame(columns=["Event Group", "Attended Students", "Paid Students", "Conversion %", "Non-Attendee Conversion %", "Lift (pp)"])
+    train_ids = set(train_df["student_id"].astype(str))
+    y = train_df.set_index("student_id")["Actual Paid"].astype(int).to_dict()
+    ev = event_rows_df[event_rows_df["student_id"].astype(str).isin(train_ids)].copy()
+    ev = ev.drop_duplicates(subset=["student_id", "event_group"])
+    rows = []
+    for group, part in ev.groupby("event_group", dropna=False):
+        attendees = set(part["student_id"].astype(str))
+        if not attendees:
+            continue
+        paid_att = sum(int(y.get(s, 0)) for s in attendees)
+        non = train_ids - attendees
+        paid_non = sum(int(y.get(s, 0)) for s in non)
+        conv = (paid_att / len(attendees) * 100.0) if attendees else 0.0
+        non_conv = (paid_non / len(non) * 100.0) if non else 0.0
+        rows.append({
+            "Event Group": clean_text(group),
+            "Attended Students": int(len(attendees)),
+            "Paid Students": int(paid_att),
+            "Conversion %": round(conv, 1),
+            "Non-Attendee Conversion %": round(non_conv, 1),
+            "Lift (pp)": round(conv - non_conv, 1),
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["Lift (pp)", "Attended Students"], ascending=[False, False]).reset_index(drop=True)
+
+
+def _ml_feature_columns(df: pd.DataFrame):
+    numeric_cols = [c for c in [
+        "community_acquired", "total_touchpoints", "active_days", "first_activity_day", "last_activity_day",
+        "touchpoints_week1", "touchpoints_week2", "touchpoints_week3", "touchpoints_week4",
+        "online_masterclass_count", "competition_count", "general_fun_count", "other_count",
+        "winner_spotlight_count", "has_activity", "has_online_masterclass", "has_competition",
+        "has_winner_spotlight", "missing_offered_date",
+        "group_count_pratham", "group_count_garima", "group_count_shahrose", "group_count_welcome",
+        "group_count_ai", "group_count_founder", "group_count_career", "group_count_competitions_group", "group_count_general_fun_group",
+        "group_attended_pratham", "group_attended_garima", "group_attended_shahrose", "group_attended_welcome",
+        "group_attended_ai", "group_attended_founder", "group_attended_career", "group_attended_competitions_group", "group_attended_general_fun_group",
+    ] if c in df.columns]
+    categorical_cols = [c for c in ["Program", "Batch", "Course", "Country", "Region", "Income", "Counsellor", "Community Acquired"] if c in df.columns]
+    return numeric_cols, categorical_cols
+
+
+def train_ml_payment_models(train_df: pd.DataFrame):
+    if not SKLEARN_AVAILABLE:
+        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "scikit-learn is not installed. Add scikit-learn to requirements.txt to enable this page."
+    if train_df is None or train_df.empty:
+        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "No training rows available."
+    y = train_df["Actual Paid"].astype(int)
+    if y.nunique() < 2 or len(train_df) < 30 or y.value_counts().min() < 5:
+        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "Not enough paid and unpaid rows for a reliable train/test split."
+
+    numeric_cols, categorical_cols = _ml_feature_columns(train_df)
+    X = train_df[numeric_cols + categorical_cols].copy()
+    for c in numeric_cols:
+        X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0)
+    for c in categorical_cols:
+        X[c] = X[c].astype(str).fillna("Unknown")
+
+    try:
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
+    preprocess = ColumnTransformer(
+        transformers=[
+            ("num", "passthrough", numeric_cols),
+            ("cat", encoder, categorical_cols),
+        ],
+        remainder="drop",
+    )
+
+    test_size = 0.25 if len(train_df) >= 80 else 0.30
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y)
+    models = {
+        "Logistic Regression": LogisticRegression(max_iter=2000, class_weight="balanced", solver="liblinear"),
+        "Random Forest": RandomForestClassifier(n_estimators=300, random_state=42, class_weight="balanced_subsample", min_samples_leaf=3, n_jobs=-1),
+        "Gradient Boosting": GradientBoostingClassifier(random_state=42),
+    }
+    rows = []
+    trained = {}
+    confusion_rows = []
+    for name, model in models.items():
+        pipe = Pipeline(steps=[("preprocess", preprocess), ("model", model)])
+        try:
+            pipe.fit(X_train, y_train)
+            if hasattr(pipe, "predict_proba"):
+                proba = pipe.predict_proba(X_test)[:, 1]
+            else:
+                proba = pipe.predict(X_test)
+            pred = (proba >= 0.5).astype(int)
+            try:
+                auc = roc_auc_score(y_test, proba) if len(np.unique(y_test)) > 1 else np.nan
+            except Exception:
+                auc = np.nan
+            precision = precision_score(y_test, pred, zero_division=0)
+            recall = recall_score(y_test, pred, zero_division=0)
+            f1 = f1_score(y_test, pred, zero_division=0)
+            acc = accuracy_score(y_test, pred)
+            tn, fp, fn, tp = confusion_matrix(y_test, pred, labels=[0, 1]).ravel()
+            rows.append({
+                "Model": name,
+                "Accuracy": round(acc, 3),
+                "Precision": round(precision, 3),
+                "Recall": round(recall, 3),
+                "F1": round(f1, 3),
+                "ROC AUC": round(float(auc), 3) if pd.notna(auc) else np.nan,
+                "Train Rows": int(len(X_train)),
+                "Test Rows": int(len(X_test)),
+            })
+            confusion_rows.append({"Model": name, "True Negative": int(tn), "False Positive": int(fp), "False Negative": int(fn), "True Positive": int(tp)})
+            trained[name] = pipe
+        except Exception as e:
+            rows.append({"Model": name, "Accuracy": np.nan, "Precision": np.nan, "Recall": np.nan, "F1": np.nan, "ROC AUC": np.nan, "Train Rows": int(len(X_train)), "Test Rows": int(len(X_test)), "Error": str(e)})
+
+    perf_df = pd.DataFrame(rows)
+    if perf_df.empty or not trained:
+        return None, perf_df, pd.DataFrame(confusion_rows), pd.DataFrame(), "Model training failed."
+    rank = perf_df.copy()
+    rank["_auc_rank"] = pd.to_numeric(rank.get("ROC AUC", np.nan), errors="coerce").fillna(-1)
+    rank["_f1_rank"] = pd.to_numeric(rank.get("F1", np.nan), errors="coerce").fillna(-1)
+    best_name = rank.sort_values(["_auc_rank", "_f1_rank"], ascending=False).iloc[0]["Model"]
+
+    # Refit selected model on all included training rows for live scoring.
+    best_model_template = models[best_name]
+    best_pipe = Pipeline(steps=[("preprocess", preprocess), ("model", best_model_template)])
+    best_pipe.fit(X, y)
+    importance_df = _ml_feature_importance(best_pipe, numeric_cols, categorical_cols)
+    return best_pipe, perf_df.drop(columns=[c for c in ["_auc_rank", "_f1_rank"] if c in perf_df.columns], errors="ignore"), pd.DataFrame(confusion_rows), importance_df, ""
+
+
+def _ml_feature_importance(pipe, numeric_cols, categorical_cols) -> pd.DataFrame:
+    try:
+        pre = pipe.named_steps["preprocess"]
+        names = []
+        if numeric_cols:
+            names.extend(numeric_cols)
+        if categorical_cols:
+            try:
+                cat_names = list(pre.named_transformers_["cat"].get_feature_names_out(categorical_cols))
+            except Exception:
+                cat_names = []
+            names.extend(cat_names)
+        model = pipe.named_steps["model"]
+        if hasattr(model, "feature_importances_"):
+            vals = model.feature_importances_
+        elif hasattr(model, "coef_"):
+            vals = np.abs(model.coef_[0])
+        else:
+            return pd.DataFrame()
+        n = min(len(names), len(vals))
+        out = pd.DataFrame({"Feature": names[:n], "Importance": vals[:n]})
+        out["Feature"] = out["Feature"].astype(str).str.replace("cat__", "", regex=False).str.replace("num__", "", regex=False)
+        out = out.sort_values("Importance", ascending=False).head(25).reset_index(drop=True)
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+
+def score_ml_students(model, feature_df: pd.DataFrame) -> pd.DataFrame:
+    if model is None or feature_df is None or feature_df.empty:
+        return pd.DataFrame()
+    numeric_cols, categorical_cols = _ml_feature_columns(feature_df)
+    X = feature_df[numeric_cols + categorical_cols].copy()
+    for c in numeric_cols:
+        X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0)
+    for c in categorical_cols:
+        X[c] = X[c].astype(str).fillna("Unknown")
+    out = feature_df.copy()
+    try:
+        out["Payment Probability"] = model.predict_proba(X)[:, 1]
+    except Exception:
+        out["Payment Probability"] = model.predict(X)
+    out["Payment Probability %"] = (out["Payment Probability"].astype(float) * 100).round(1)
+    out["Prediction Band"] = out["Payment Probability"].map(_ml_probability_band)
+    out["Top Factors"] = out.apply(_ml_student_reason, axis=1)
+    return out.sort_values("Payment Probability", ascending=False).reset_index(drop=True)
+
+
+def render_ml_predictions_page(data):
+    st.subheader("ML Predictions")
+    st.caption("Payment prediction uses pre-payment behavior only. Post-payment behavior is intentionally excluded and can be used later for refund-risk prediction.")
+
+    if not SKLEARN_AVAILABLE:
+        st.error("scikit-learn is not installed in this environment. Add `scikit-learn` to requirements.txt to enable ML training and scoring.")
+        return
+
+    with st.spinner("Building pre-payment feature set and training models..."):
+        feature_df, train_df, event_intel_df, group_intel_df = build_ml_prediction_dataset(data)
+        model, perf_df, confusion_df, importance_df, err = train_ml_payment_models(train_df)
+        scored_df = score_ml_students(model, feature_df) if model is not None else pd.DataFrame()
+
+    if feature_df.empty:
+        st.warning("No student feature rows could be built from the current data.")
+        return
+    if err:
+        st.warning(err)
+
+    included = int(train_df.shape[0]) if train_df is not None else 0
+    paid_rows = int(train_df["Actual Paid"].sum()) if train_df is not None and not train_df.empty else 0
+    refund_excluded = int(feature_df.get("Refund Excluded", pd.Series(0, index=feature_df.index)).sum()) if not feature_df.empty else 0
+    pred_source = scored_df if not scored_df.empty else feature_df.copy()
+    if "Prediction Band" not in pred_source.columns:
+        pred_source["Prediction Band"] = "Not scored"
+        pred_source["Payment Probability %"] = np.nan
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Students Scored", f"{len(feature_df):,}")
+    m2.metric("Training Rows", f"{included:,}", delta=f"{paid_rows:,} paid")
+    m3.metric("Refund Excluded", f"{refund_excluded:,}")
+    m4.metric("Current Paid Rate", f"{(paid_rows / included * 100) if included else 0:.1f}%")
+
+    st.markdown("### Prediction Bands")
+    band_order = ["High Intent", "Medium Intent", "Low Intent", "Not scored"]
+    band_df = pred_source.groupby("Prediction Band", as_index=False).size().rename(columns={"size": "Students"})
+    band_df["Prediction Band"] = pd.Categorical(band_df["Prediction Band"], categories=band_order, ordered=True)
+    band_df = band_df.sort_values("Prediction Band")
+    if not band_df.empty:
+        fig = px.bar(band_df, x="Prediction Band", y="Students", text="Students", title="Predicted Payment Intent Bands")
+        fig.update_traces(marker_color=GREEN_2, textposition="outside")
+        st.plotly_chart(nice_layout(fig, height=330), use_container_width=True, key="ml_prediction_bands")
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Student Predictions", "Model Performance", "Event Conversion", "Feature Importance", "Training Data Audit"])
+
+    with tab1:
+        st.markdown("#### Student-level payment probability")
+        if scored_df.empty:
+            st.info("Student probability scoring is unavailable until a model is trained successfully.")
+        else:
+            program_filter = st.multiselect("Program", sorted([x for x in scored_df["Program"].dropna().astype(str).unique() if x]), default=sorted([x for x in scored_df["Program"].dropna().astype(str).unique() if x]), key="ml_program_filter")
+            band_filter = st.multiselect("Prediction Band", ["High Intent", "Medium Intent", "Low Intent"], default=["High Intent", "Medium Intent", "Low Intent"], key="ml_band_filter")
+            show_df = scored_df.copy()
+            if program_filter:
+                show_df = show_df[show_df["Program"].astype(str).isin(program_filter)]
+            if band_filter:
+                show_df = show_df[show_df["Prediction Band"].astype(str).isin(band_filter)]
+            cols = [c for c in [
+                "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Community Acquired",
+                "Payment Probability %", "Prediction Band", "Actual Paid", "total_touchpoints", "online_masterclass_count",
+                "competition_count", "general_fun_count", "winner_spotlight_count", "Top Factors", "Offered Date", "Observation Cutoff"
+            ] if c in show_df.columns]
+            display = show_df[cols].copy()
+            if "Actual Paid" in display.columns:
+                display["Actual Paid"] = display["Actual Paid"].map(lambda x: "Yes" if int(x) == 1 else "No")
+            st.dataframe(display, use_container_width=True, height=560, hide_index=True, key="ml_student_predictions_table")
+
+    with tab2:
+        st.markdown("#### Train/test model performance")
+        st.caption("Models are trained on historical current-payment outcomes using a stratified train/test split. Precision shows how reliable paid predictions are; recall shows how many actual paid students the model catches.")
+        if perf_df is not None and not perf_df.empty:
+            st.dataframe(perf_df, use_container_width=True, hide_index=True, key="ml_model_performance_table")
+            metric_long = perf_df.melt(id_vars="Model", value_vars=[c for c in ["Accuracy", "Precision", "Recall", "F1", "ROC AUC"] if c in perf_df.columns], var_name="Metric", value_name="Score")
+            fig = px.bar(metric_long, x="Model", y="Score", color="Metric", barmode="group", text="Score", title="Model Performance Comparison")
+            fig.update_traces(textposition="outside")
+            st.plotly_chart(nice_layout(fig, height=390), use_container_width=True, key="ml_model_performance_chart")
+        else:
+            st.info("Model performance is unavailable.")
+        if confusion_df is not None and not confusion_df.empty:
+            st.markdown("#### Confusion matrix by model")
+            st.dataframe(confusion_df, use_container_width=True, hide_index=True, key="ml_confusion_table")
+
+    with tab3:
+        st.markdown("#### Event conversion intelligence")
+        st.caption("This is correlation, not proof of causation. It compares students who attended an event before payment/cutoff with students who did not attend it.")
+        min_att = st.slider("Minimum attended students", 1, 100, 10, key="ml_min_attended")
+        gdf = group_intel_df[group_intel_df["Attended Students"].ge(min_att)].copy() if group_intel_df is not None and not group_intel_df.empty else pd.DataFrame()
+        edf = event_intel_df[event_intel_df["Attended Students"].ge(min_att)].copy() if event_intel_df is not None and not event_intel_df.empty else pd.DataFrame()
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.markdown("##### Event groups connected with conversion")
+            if not gdf.empty:
+                st.dataframe(gdf, use_container_width=True, hide_index=True, height=360, key="ml_group_conversion_table")
+            else:
+                st.info("No event group rows meet the selected attendance threshold.")
+        with c2:
+            st.markdown("##### Top event-group lift")
+            if not gdf.empty:
+                chart_df = gdf.sort_values("Lift (pp)", ascending=False).head(10)
+                fig = px.bar(chart_df, x="Lift (pp)", y="Event Group", orientation="h", text="Lift (pp)", title="Conversion Lift by Event Group")
+                fig.update_traces(marker_color=GREEN_2)
+                st.plotly_chart(nice_layout(fig, height=360), use_container_width=True, key="ml_group_lift_chart")
+        st.markdown("##### Event-level conversion table")
+        if not edf.empty:
+            st.dataframe(edf.head(150), use_container_width=True, hide_index=True, height=520, key="ml_event_conversion_table")
+        else:
+            st.info("No event rows meet the selected attendance threshold.")
+
+    with tab4:
+        st.markdown("#### Model factor importance")
+        if importance_df is not None and not importance_df.empty:
+            st.dataframe(importance_df, use_container_width=True, hide_index=True, key="ml_feature_importance_table")
+            chart_df = importance_df.head(15).copy().sort_values("Importance", ascending=True)
+            fig = px.bar(chart_df, x="Importance", y="Feature", orientation="h", title="Top Model Factors")
+            fig.update_traces(marker_color=GREEN_2)
+            st.plotly_chart(nice_layout(fig, height=480), use_container_width=True, key="ml_feature_importance_chart")
+        else:
+            st.info("Feature importance is unavailable for the selected model.")
+
+    with tab5:
+        st.markdown("#### Training feature dataset audit")
+        st.caption("Refund rows are excluded from this payment model. Behavior columns are built only up to payment date for paid students and first-30-days cutoff for unpaid students.")
+        audit_cols = [c for c in [
+            "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Income", "Counsellor", "Community Acquired",
+            "Actual Paid", "Refund Excluded", "training_included", "Offered Date", "Deadline", "Payment Date", "Observation Cutoff",
+            "total_touchpoints", "active_days", "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
+            "group_count_pratham", "group_count_garima", "group_count_shahrose", "group_count_ai", "group_count_founder", "group_count_career"
+        ] if c in feature_df.columns]
+        st.dataframe(feature_df[audit_cols], use_container_width=True, height=560, hide_index=True, key="ml_training_audit_table")
+
+
 def main():
     cfg = resolve_source()
     render_header(cfg)
 
     with st.sidebar:
         st.markdown("## 🧭 Navigation")
-        default_pages = ["Overview", "Recent Activity", "Success Metrics", "Student Profile"]
+        default_pages = ["Overview", "Recent Activity", "Success Metrics", "Student Profile", "ML Predictions"]
         default_index = default_pages.index(st.session_state.get("nav_page", "Overview")) if st.session_state.get("nav_page", "Overview") in default_pages else 0
         page = st.radio("Go to", default_pages, index=default_index, label_visibility="collapsed", key="nav")
         st.session_state["nav_page"] = page
@@ -8822,6 +9627,8 @@ def main():
         render_success_metrics_page(data)
     elif page == "Student Profile":
         render_student_profile(data)
+    elif page == "ML Predictions":
+        render_ml_predictions_page(data)
 
 
 if __name__ == "__main__":
