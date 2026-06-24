@@ -9006,13 +9006,15 @@ def _ml_probability_band(prob: float) -> str:
         p = float(prob)
     except Exception:
         p = 0.0
-    if p >= 0.80:
+    # Business-facing bands are intentionally stricter than the raw model
+    # threshold so the dashboard does not over-label unpaid students as high intent.
+    if p >= 0.85:
         return "Very High Intent"
-    if p >= 0.65:
+    if p >= 0.70:
         return "High Intent"
-    if p >= 0.40:
+    if p >= 0.45:
         return "Medium Intent"
-    if p >= 0.20:
+    if p >= 0.25:
         return "Low Intent"
     return "Cold"
 
@@ -9034,6 +9036,9 @@ def _ml_student_reason(row: pd.Series) -> str:
     except Exception:
         pass
 
+    current_status = clean_text(row.get("Current Status", ""))
+    if current_status:
+        reasons.append(f"current status reference: {current_status}")
     if bool(row.get("community_acquired", False)):
         reasons.append("joined community")
     else:
@@ -9759,6 +9764,8 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None, program_filt
             "Payment Date": payment_dt,
             "Observation Cutoff": cutoff_dt,
             "Observation Scope": observation_scope,
+            "Current Status": clean_text(status_source.loc[idx]) if idx in status_source.index else "",
+            "Status Reference Signal": _ml_status_reference_signal(clean_text(status_source.loc[idx]) if idx in status_source.index else ""),
             "Actual Paid": int(is_paid),
             "Refund / Later Refunded": int(is_refund),
             "training_included": 1,
@@ -10058,7 +10065,10 @@ def _ml_feature_columns(df: pd.DataFrame):
         # Eligibility is deliberately NOT used by the base ML model.
         # It is applied later as a positive-only uplift/floor, so low eligible
         # attendance can never downgrade a student's probability.
-        "observation_days", "touchpoints_per_observed_day", "touchpoints_per_active_day",
+        # Raw observation_days is deliberately excluded: it can become a proxy for
+        # early payment because converted students often have shorter pre-payment
+        # windows. Keep behavior density rates instead.
+        "touchpoints_per_observed_day", "touchpoints_per_active_day",
         "meaningful_touchpoints", "online_competition_count",
         "activated_week1", "activated_week2", "activated_first30", "early_meaningful_activity",
         "post_deadline_touchpoints", "post_deadline_active_days", "reactivated_after_deadline",
@@ -10108,11 +10118,15 @@ def _ml_threshold_for_mode(base_threshold: float, mode: str) -> float:
     except Exception:
         base = 0.50
     mode = clean_text(mode).lower()
+    # Use a business-safe operating floor for live unpaid-student pipeline scoring.
+    # The train/test table still reports each model's tuned statistical threshold,
+    # but live "Likely to Pay" should not become too broad when a split picks a
+    # low F1 threshold.
     if "recall" in mode:
-        return max(0.05, min(0.95, base - 0.15))
+        return max(0.45, min(0.95, base - 0.10))
     if "precision" in mode:
-        return max(0.05, min(0.95, base + 0.15))
-    return max(0.05, min(0.95, base))
+        return max(0.72, min(0.95, base + 0.12))
+    return max(0.60, min(0.95, base))
 
 
 def _ml_prediction_label(prob: float, threshold: float) -> str:
@@ -10363,6 +10377,69 @@ def _ml_feature_importance(pipe, numeric_cols, categorical_cols) -> pd.DataFrame
 
 
 
+
+def _ml_status_reference_signal(status_text: str) -> float:
+    """Light current-status reference used only after scoring, never as a base ML feature.
+
+    This prevents leakage from final paid statuses while still letting counsellor/status
+    notes gently calibrate the live unpaid pipeline. Positive statuses can add a small
+    boost; low/cold statuses are handled by a soft cap in `_ml_status_soft_cap`.
+    """
+    s = clean_text(status_text).lower()
+    if not s:
+        return 0.0
+    # Do not use final paid/refund labels as positive prediction evidence.
+    if "admitted" in s or "refund" in s:
+        return 0.0
+    high_patterns = [
+        "high intent", "will pay high", "payment in progress", "payment pending",
+        "paying", "confirmed", "hot", "converted soon", "ready to pay",
+    ]
+    medium_patterns = [
+        "will pay", "interested", "warm", "deadline extended", "extended", "follow up",
+        "follow-up", "asked", "considering", "maybe", "positive",
+    ]
+    low_patterns = ["will pay low", "low", "cold", "not interested", "not responding", "unresponsive", "lost", "dropped"]
+    if any(p in s for p in high_patterns):
+        return 0.060
+    if any(p in s for p in low_patterns):
+        return 0.0
+    if any(p in s for p in medium_patterns):
+        return 0.030
+    return 0.0
+
+
+def _ml_status_soft_cap(row: pd.Series, probability: float) -> float:
+    """Use current status as a light calibration reference for unpaid rows.
+
+    Low/cold statuses should not erase real engagement signals, but they should stop
+    weakly-engaged students from being shown as High Intent just because of broad ML
+    uplift. Strong behavioral evidence overrides this cap.
+    """
+    try:
+        p = float(probability)
+    except Exception:
+        return 0.0
+    status = clean_text(row.get("Current Status", "")).lower()
+    if not status:
+        return p
+    # Never cap historical converted rows or final paid/refund statuses.
+    if int(row.get("Actual Paid", 0) or 0) == 1 or "admitted" in status or "refund" in status:
+        return p
+    strong_signal = (
+        int(row.get("winner_spotlight_count", 0) or 0) > 0
+        or int(row.get("meaningful_touchpoints", 0) or 0) >= 3
+        or clean_text(row.get("Engagement Quality", "")) == "High Engaged"
+        or (float(row.get("eligible_attendance_rate", 0) or 0) >= 0.70 and int(row.get("eligible_attended_events", 0) or 0) >= 4)
+    )
+    very_low_patterns = ["not interested", "lost", "dropped", "drop", "not joining", "declined"]
+    low_patterns = ["will pay low", "low", "cold", "not responding", "unresponsive", "no response"]
+    if any(x in status for x in very_low_patterns) and not strong_signal:
+        return min(p, 0.35)
+    if any(x in status for x in low_patterns) and not strong_signal:
+        return min(p, 0.50)
+    return p
+
 def _ml_positive_engagement_uplift(row: pd.Series) -> float:
     """Bounded positive-only uplift from known intent signals.
 
@@ -10400,61 +10477,63 @@ def _ml_positive_engagement_uplift(row: pd.Series) -> float:
     post_meaningful = _num("post_deadline_meaningful_touchpoints")
 
     if int(row.get("community_acquired", 0) or 0) > 0:
-        uplift += 0.03
-    uplift += min(total, 4) * 0.015
-    uplift += min(active_days, 4) * 0.012
-    uplift += min(om, 4) * 0.040
-    uplift += min(comp, 3) * 0.050
-    uplift += min(winner, 2) * 0.100
-    uplift += min(hi, 4) * 0.035
-    uplift += min(hi_div, 3) * 0.025
+        uplift += 0.015
+    uplift += min(total, 4) * 0.008
+    uplift += min(active_days, 4) * 0.006
+    uplift += min(om, 4) * 0.020
+    uplift += min(comp, 3) * 0.025
+    uplift += min(winner, 2) * 0.060
+    uplift += min(hi, 4) * 0.018
+    uplift += min(hi_div, 3) * 0.012
     # Eligibility is upgrade-only: high attendance out of eligible journey events
     # can lift the score, but a low ratio is never used as a penalty.
-    uplift += min(elig, 5) * 0.008
-    uplift += min(elig_meaningful, 4) * 0.028
+    uplift += min(elig, 5) * 0.004
+    uplift += min(elig_meaningful, 4) * 0.014
     if elig_total >= 4 and elig_rate >= 0.70:
-        uplift += 0.070
+        uplift += 0.018
     elif elig_total >= 3 and elig_rate >= 0.50:
-        uplift += 0.040
+        uplift += 0.010
     if elig_meaningful_total >= 2 and elig_meaningful_rate >= 0.70:
-        uplift += 0.080
+        uplift += 0.040
     elif elig_meaningful_total >= 2 and elig_meaningful_rate >= 0.50:
-        uplift += 0.045
+        uplift += 0.022
     if weighted_rate >= 0.70:
-        uplift += 0.070
+        uplift += 0.018
     elif weighted_rate >= 0.50:
-        uplift += 0.040
-    uplift += min(weighted / 20.0, 1.0) * 0.080
-    uplift += min(post_elig, 3) * 0.010
+        uplift += 0.010
+    uplift += min(weighted / 20.0, 1.0) * 0.040
+    uplift += min(post_elig, 3) * 0.005
     if post_elig_rate >= 0.60 or post_weighted_rate >= 0.60:
-        uplift += 0.040
-    uplift += min(post_meaningful, 3) * 0.035
+        uplift += 0.010
+    uplift += min(post_meaningful, 3) * 0.018
     if int(row.get("reactivated_after_deadline", 0) or 0) > 0:
-        uplift += 0.035
+        uplift += 0.018
     if int(row.get("activated_week1", 0) or 0) > 0:
-        uplift += 0.035
+        uplift += 0.018
     elif int(row.get("activated_week2", 0) or 0) > 0:
-        uplift += 0.020
+        uplift += 0.010
     if int(row.get("early_meaningful_activity", 0) or 0) > 0:
-        uplift += 0.040
+        uplift += 0.010
 
     eq = clean_text(row.get("Engagement Quality", ""))
     if eq == "High Engaged":
-        uplift += 0.160
+        uplift += 0.070
     elif eq == "Medium Engaged":
-        uplift += 0.095
+        uplift += 0.040
     elif eq == "Low Engaged":
-        uplift += 0.030
+        uplift += 0.012
 
-    return round(max(0.0, min(0.55, uplift)), 4)
+    uplift += _ml_status_reference_signal(row.get("Current Status", ""))
+    return round(max(0.0, min(0.30, uplift)), 4)
 
 
 def _ml_positive_probability_floor(row: pd.Series) -> float:
-    """Minimum probability floor from positive engagement-quality rules only.
+    """Conservative positive floor from strong engagement signals only.
 
-    Floors prevent obviously engaged/high-impact unpaid students from appearing as
-    0–2% simply because a small/split historical model is conservative. They are
-    monotonic positive rules: no signal ever decreases probability.
+    The floor prevents truly engaged students from appearing as 0–2%, but it is
+    intentionally conservative so large unpaid pools do not become High Intent.
+    Eligibility remains upgrade-only: strong eligible attendance can lift; weak
+    eligible attendance never reduces the score.
     """
     def _int(name):
         try:
@@ -10489,50 +10568,56 @@ def _ml_positive_probability_floor(row: pd.Series) -> float:
 
     floor = 0.0
     if winner > 0:
-        floor = max(floor, 0.68)
-    if eq == "High Engaged" and (om + comp + winner + hi) > 0:
-        floor = max(floor, 0.66)
-    elif eq == "High Engaged":
-        floor = max(floor, 0.52)
-    if eq == "Medium Engaged":
-        floor = max(floor, 0.46)
-    if eq == "Low Engaged" and total > 0:
-        floor = max(floor, 0.24)
-    if hi >= 3:
         floor = max(floor, 0.60)
-    elif hi >= 2:
-        floor = max(floor, 0.52)
-    elif hi >= 1:
-        floor = max(floor, 0.36)
-    if comp >= 2 or om >= 3:
+    if eq == "High Engaged" and (om + comp + winner + hi) > 0:
+        floor = max(floor, 0.58)
+    elif eq == "High Engaged":
+        floor = max(floor, 0.45)
+    if eq == "Medium Engaged":
+        floor = max(floor, 0.38)
+    if eq == "Low Engaged" and total > 0:
+        floor = max(floor, 0.18)
+    if hi >= 3:
         floor = max(floor, 0.50)
-    elif comp >= 1 or om >= 1:
-        floor = max(floor, 0.30)
-    if meaningful >= 3:
-        floor = max(floor, 0.48)
-    # Eligibility is upgrade-only. Strong attendance out of eligible events
-    # creates a positive floor; weak attendance creates no floor and no penalty.
-    if eligible >= 7 and eligible_attended >= 6 and eligible_rate >= 0.70:
-        floor = max(floor, 0.62)
-    elif eligible >= 4 and eligible_rate >= 0.75:
-        floor = max(floor, 0.56)
-    elif eligible >= 3 and eligible_rate >= 0.50:
+    elif hi >= 2:
         floor = max(floor, 0.42)
-    if eligible_meaningful >= 3 and eligible_meaningful_attended >= 2 and eligible_meaningful_rate >= 0.60:
-        floor = max(floor, 0.58)
-    elif eligible_meaningful >= 2 and eligible_meaningful_rate >= 0.50:
-        floor = max(floor, 0.46)
-    if weighted_rate >= 0.75:
-        floor = max(floor, 0.58)
-    elif weighted_rate >= 0.55:
+    elif hi >= 1:
+        floor = max(floor, 0.30)
+    if comp >= 2 or om >= 3:
+        floor = max(floor, 0.42)
+    elif comp >= 1 or om >= 1:
+        floor = max(floor, 0.24)
+    if meaningful >= 3:
+        floor = max(floor, 0.40)
+    # Eligibility is upgrade-only. Strong journey completion lifts confidence;
+    # low attendance creates no floor and no penalty.
+    if eligible >= 7 and eligible_attended >= 6 and eligible_rate >= 0.70:
+        floor = max(floor, 0.55)
+    elif eligible >= 4 and eligible_rate >= 0.75:
         floor = max(floor, 0.48)
+    elif eligible >= 3 and eligible_rate >= 0.50:
+        floor = max(floor, 0.35)
+    if eligible_meaningful >= 3 and eligible_meaningful_attended >= 2 and eligible_meaningful_rate >= 0.60:
+        floor = max(floor, 0.45)
+    elif eligible_meaningful >= 2 and eligible_meaningful_rate >= 0.50:
+        floor = max(floor, 0.38)
+    if weighted_rate >= 0.75:
+        floor = max(floor, 0.48)
+    elif weighted_rate >= 0.55:
+        floor = max(floor, 0.40)
     if post_meaningful >= 2:
-        floor = max(floor, 0.44)
-    elif post_meaningful >= 1:
-        floor = max(floor, 0.34)
-    if int(row.get("community_acquired", 0) or 0) > 0 and meaningful >= 1:
         floor = max(floor, 0.36)
-    return round(max(0.0, min(0.85, floor)), 4)
+    elif post_meaningful >= 1:
+        floor = max(floor, 0.28)
+    if int(row.get("community_acquired", 0) or 0) > 0 and meaningful >= 1:
+        floor = max(floor, 0.30)
+
+    status_signal = _ml_status_reference_signal(row.get("Current Status", ""))
+    if status_signal >= 0.06:
+        floor = max(floor, 0.45)
+    elif status_signal > 0:
+        floor = max(floor, 0.30)
+    return round(max(0.0, min(0.70, floor)), 4)
 
 
 def _ml_apply_positive_probability_adjustment(base_prob, row: pd.Series):
@@ -10545,8 +10630,9 @@ def _ml_apply_positive_probability_adjustment(base_prob, row: pd.Series):
     floor = _ml_positive_probability_floor(row)
     adjusted = base + (uplift * (1.0 - base))
     adjusted = max(adjusted, floor)
-    adjusted = max(base, adjusted)  # positive-only; never reduce base ML score
-    return round(max(0.0, min(0.97, adjusted)), 6), uplift, floor
+    adjusted = max(base, adjusted)  # engagement/eligibility upgrades never reduce base ML score
+    adjusted = _ml_status_soft_cap(row, adjusted)
+    return round(max(0.0, min(0.92, adjusted)), 6), uplift, floor
 
 def score_ml_students(model, feature_df: pd.DataFrame, threshold_mode: str = "Balanced") -> pd.DataFrame:
     if model is None or feature_df is None or feature_df.empty:
@@ -10632,7 +10718,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         "Prediction threshold mode",
         ["Balanced", "High Recall", "High Precision"],
         index=0,
-        help="Balanced uses the tuned F1 threshold. High Recall catches more possible converters. High Precision reduces false positives.",
+        help="Balanced uses a business-safe threshold floor to avoid over-broad high-intent lists. High Recall catches more possible converters. High Precision reduces false positives.",
         key=_ml_key("ml_threshold_mode"),
     )
     _update_ml_progress(96, "Scoring all students using journey-window features...")
@@ -10663,7 +10749,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
     m4.metric("High Intent Unpaid", f"{high_intent_unpaid:,}", delta=f"{likely_unpaid:,} likely to pay")
     m5.metric("Avg Unpaid Probability", f"{avg_unpaid_prob:.1f}%")
     st.caption(
-        f"Primary scoring model: {primary_name}. Balanced threshold: {primary_threshold:.3f}; active {threshold_mode} threshold: {active_threshold:.3f}. "
+        f"Primary scoring model: {primary_name}. Statistical balanced threshold: {primary_threshold:.3f}; active business-safe {threshold_mode} threshold: {active_threshold:.3f}. "
         "The selected model is evaluated with train/test split, then refit on all historical labelled rows before scoring current unpaid students."
     )
 
@@ -10718,7 +10804,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
             if band_filter and "Prediction Band" in show_df.columns:
                 show_df = show_df[show_df["Prediction Band"].astype(str).isin(band_filter)]
             cols = [c for c in [
-                "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Counsellor", "Community Acquired",
+                "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Counsellor", "Community Acquired", "Current Status", "Status Reference Signal",
                 "Payment Probability %", "Base ML Probability %", "Positive Engagement Uplift %", "Positive Signal Floor %", "Prediction Band", "Predicted Conversion", "Model Threshold",
                 "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days",
                 "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
@@ -10734,9 +10820,9 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
             if not seg.empty:
                 seg["Priority Segment"] = np.select(
                     [
-                        seg["Payment Probability"].astype(float).ge(0.80),
-                        seg["Payment Probability"].astype(float).ge(0.65),
-                        seg["Payment Probability"].astype(float).ge(0.40),
+                        seg["Payment Probability"].astype(float).ge(0.85),
+                        seg["Payment Probability"].astype(float).ge(0.70),
+                        seg["Payment Probability"].astype(float).ge(0.45),
                     ],
                     ["Immediate payment follow-up", "High-intent nurture", "Medium-intent activation"],
                     default="Low-intent nurture",
