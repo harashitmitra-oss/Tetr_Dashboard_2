@@ -33,7 +33,7 @@ try:
 except Exception:
     SKLEARN_AVAILABLE = False
 
-st.set_page_config(page_title="Tetr Analytics Dashboard", layout="wide")
+st.set_page_config(page_title="Tetr ML Prediction Dashboard", layout="wide")
 
 MASTER_SHEETS = ["Master UG", "Master PG"]
 UG_BATCH_SHEETS = ["UG - B1 to B4", "UG B5", "UG B6", "UG B7", "UG B8", "UG B9", "UG B10", "UG B11", "UG B12", "UG B13", "UG B14", "UG B15", "UG B16"]
@@ -1698,7 +1698,7 @@ def render_header(cfg):
     c1, c2 = st.columns([5.5, 1.9])
     with c1:
         logo = find_logo_path()
-        hero_html = '<div class="hero-card"><div style="font-size:30px; font-weight:900; color:#0b3d2e;">Tetr Analytics Dashboard</div><div style="margin-top:6px; color:#2e6b57; font-weight:600;">Live overview, batch analytics, and student-level tracking across Master, Batch, and Tetr-X sheets.</div><div style="margin-top:10px; color:#5b7f6e; font-size:13px; font-weight:600;">Developed by <span style="color:#0b3d2e; font-weight:800;">Harashit Mitra</span></div></div>'
+        hero_html = '<div class="hero-card"><div style="font-size:30px; font-weight:900; color:#0b3d2e;">Tetr ML Prediction Dashboard</div><div style="margin-top:6px; color:#2e6b57; font-weight:600;">Live conversion intelligence, payment probability scoring, and student-level ML predictions across Master, Batch, and Tetr-X sheets.</div><div style="margin-top:10px; color:#5b7f6e; font-size:13px; font-weight:600;">Developed by <span style="color:#0b3d2e; font-weight:800;">Harashit Mitra</span></div></div>'
         if logo is not None:
             a, b = st.columns([0.12, 0.88])
             with a:
@@ -8802,34 +8802,166 @@ def render_community_impact_page(data):
 # ---------------- ML Predictions ----------------
 
 def _ml_event_group(event_name: str, event_type: str = "") -> str:
-    """Speaker/topic grouping for ML conversion intelligence."""
-    text = f"{clean_text(event_name)} {clean_text(event_type)}".lower()
-    if "pratham" in text:
-        return "Pratham Events"
-    if "garima" in text or "dr garima" in text:
-        return "Garima Events"
-    if "shahrose" in text or "visa" in text or "travel" in text:
-        return "Shahrose / Visa / Travel"
-    if "harshit" in text or "welcome webinar" in text or "welcome" in text:
-        return "Welcome / Harshit Events"
-    if "amitoj" in text:
-        return "Amitoj Events"
-    if "tarun" in text:
-        return "Tarun Events"
-    if any(k in text for k in ["ai", "voice agent", "automation", "agent"]):
-        return "AI / Automation Events"
-    if any(k in text for k in ["founder", "startup", "vc", "venture", "fund", "pitch", "tif", "innovation fund"]):
-        return "Founder / Startup / VC"
-    if any(k in text for k in ["career", "resume", "linkedin", "proof of work", "communication", "storytelling"]):
-        return "Career / Communication"
-    typ = _community_impact_event_bucket(event_type)
-    if typ == "Competition":
-        return "Competitions / Hackathons"
-    if typ == "General/Fun":
-        return "General / Fun"
-    if typ == "Online Events & Masterclasses":
-        return "Other Online / Masterclass"
+    """Repeatable speaker/topic/challenge grouping for ML conversion intelligence.
+
+    The grouping intentionally uses stable keyword families rather than exact
+    event titles because many events are repeated across UG/PG batches with
+    slightly different names, punctuation, or speaker suffixes.
+    """
+    raw_name = clean_text(event_name)
+    raw_type = clean_text(event_type)
+    text = f"{raw_name} {raw_type}".lower()
+    text = text.replace("’", "'").replace("“", '"').replace("”", '"')
+    text = re.sub(r"\s+", " ", text).strip()
+    bucket = _community_impact_event_bucket(raw_type)
+
+    # Repetitive competitions / hackathons first, so generic speaker/topic rules
+    # do not swallow important challenge families.
+    if any(k in text for k in ["netflix", "netflix ceo"]):
+        return "Competition · Netflix CEO"
+    if any(k in text for k in ["instagram", "instagram ceo"]):
+        return "Competition · Instagram CEO"
+    if any(k in text for k in ["nike", "nike ceo"]):
+        return "Competition · Nike CEO"
+    if any(k in text for k in ["elevator pitch", "shark tank", "pitch competition"]):
+        return "Competition · Elevator Pitch / Shark Tank"
+    if any(k in text for k in ["build your own tetr club", "build your tetr club", "tetr club", "club idea"]):
+        return "Competition · Build Your Tetr Club"
+    if any(k in text for k in ["startup hackathon", "hackerthon", "problem statement", "milestone", "office hours"]):
+        if any(k in text for k in ["voice agent", "ai voice", "agent"]):
+            return "Hackathon · AI Voice Agent"
+        if "finance" in text:
+            return "Hackathon · Finance"
+        return "Hackathon · Startup Hackathon"
+    if any(k in text for k in ["product innovation", "product, psychology", "pricing challenge", "willingness to pay"]):
+        return "Competition · Product / Pricing"
+    if any(k in text for k in ["$100", "100 startup", "100 challenge"]):
+        return "Competition · $100 Startup"
+    if any(k in text for k in ["video challenge", "solve for the future"]):
+        return "Competition · Video Challenge"
+    if any(k in text for k in ["tetrlocked", "quiz"]):
+        return "Competition · Quiz / TetrLocked"
+    if any(k in text for k in ["capstone", "negotiation challenge"]):
+        return "Competition · Capstone / Negotiation"
+    if "dropshipping" in text:
+        return "Competition · Dropshipping"
+    if "healthcare hackathon" in text:
+        return "Hackathon · Healthcare"
+
+    # Repeated online events / masterclasses by speaker, theme, or format.
+    if any(k in text for k in ["welcome webinar", "welcome- webinar", "inside the top", "know your batch welcome"]):
+        return "Online · Welcome Webinar"
+    if any(k in text for k in ["life at tetr", "student experience", "tetr tribe", "tribe unfiltered", "jessica", "yuliia"]):
+        return "Online · Life at Tetr / Student Experience"
+    if any(k in text for k in ["garima", "dr garima", "learning happens", "sneak peek", "classroom", "bfai", "bsai"]):
+        return "Online · Garima / Learning at Tetr"
+    if any(k in text for k in ["pratham", "founder's playbook", "founders playbook", "founder’s playbook"]):
+        return "Online · Pratham / Founder’s Playbook"
+    if any(k in text for k in ["tarun", "co-founder", "cofounder", "$100k business", "100k business"]):
+        return "Online · Tarun / Co-founder"
+    if any(k in text for k in ["amitoj", "fortune 500", "beyond borders", "opens opportunities"]):
+        return "Online · Amitoj / Opportunities"
+    if any(k in text for k in ["shahrose", "visa", "travel", "ibmt", "asu", "aradhita", "shanghai visa"]):
+        return "Online · Shahrose / Visa / Travel"
+    if any(k in text for k in ["kritee", "students built", "50+ businesses", "3 global businesses", "real companies"]):
+        return "Online · Kritee / Student Businesses"
+    if any(k in text for k in ["sarthak", "global businesses", "joe contini", "global markets"]):
+        return "Online · Sarthak / Global Businesses"
+    if any(k in text for k in ["ai agents", "data into actionable", "ai voice", "ai-ready", "automation", "build ai", "gamified product", "kevyn", "mohammed"]):
+        return "Online · AI / Product / Automation"
+    if any(k in text for k in ["career", "resume", "linkedin", "proof of work", "cold email", "communication", "interview", "silvia", "tathiana", "thathiana", "cheryl", "maya", "srishti"]):
+        return "Online · Career / LinkedIn / Resume"
+    if any(k in text for k in ["storytelling", "lizzie", "financial storytelling", "angelo"]):
+        return "Masterclass · Storytelling"
+    if any(k in text for k in ["kevin allen", "globally diverse", "advertise yourself", "command the room", "create an idea"]):
+        return "Masterclass · Kevin Allen"
+    if any(k in text for k in ["franco", "ikigai", "100 days roadmap"]):
+        return "Masterclass · Franco / IKIGAI"
+    if any(k in text for k in ["innovation fund", "tif", "aayush"]):
+        return "Online · TIF / Innovation Fund"
+    if any(k in text for k in ["vc", "venture", "raise money", "michel", "think like a vc", "vc connect"]):
+        return "Online · VC / Fundraising"
+    if any(k in text for k in ["blockchain", "nitin gaur"]):
+        return "Masterclass · Blockchain"
+    if any(k in text for k in ["startup pitfalls", "joyce tay"]):
+        return "Masterclass · Startup Pitfalls"
+    if any(k in text for k in ["negotiate", "karyn"]):
+        return "Masterclass · Negotiation"
+    if any(k in text for k in ["pricing strategy", "pricing masterclass"]):
+        return "Masterclass · Pricing Strategy"
+    if any(k in text for k in ["parents", "parent"]):
+        return "Online · Parents AMA"
+    if any(k in text for k in ["mandarin", "china", "hunter yan"]):
+        return "Online · China / Mandarin"
+
+    # General / fun engagement families.
+    if any(k in text for k in ["introduction", "introduce yourself", "introduced themselves", "indroduction"]):
+        return "General · Introductions"
+    if any(k in text for k in ["what's your why", "whats your why", "what’s your why", "your why"]):
+        return "General · What’s Your Why"
+    if any(k in text for k in ["one photo", "photo activity", "your story", "culture", "pet", "cover", "headline", "stories matter"]):
+        return "General · Story / Culture / Photo"
+    if any(k in text for k in ["game", "meme", "movie", "fun", "bingo", "new year", "college memory", "gratitude"]):
+        return "General · Fun / Games"
+    if bucket == "General/Fun" or raw_type.lower() in {"poll", "fun task", "quiz"}:
+        return "General · Polls / Check-ins"
+
+    if bucket == "Competition":
+        return "Competition · Other"
+    if bucket == "Online Events & Masterclasses":
+        return "Online · Other"
     return "Other"
+
+
+def _ml_event_group_feature_map() -> dict:
+    """Stable event-group features used by the ML model and audit tables."""
+    return {
+        "Online · Welcome Webinar": "group_count_welcome_webinar",
+        "Online · Life at Tetr / Student Experience": "group_count_life_at_tetr",
+        "Online · Garima / Learning at Tetr": "group_count_garima_learning",
+        "Online · Pratham / Founder’s Playbook": "group_count_pratham_founder",
+        "Online · Tarun / Co-founder": "group_count_tarun_cofounder",
+        "Online · Amitoj / Opportunities": "group_count_amitoj_opportunities",
+        "Online · Shahrose / Visa / Travel": "group_count_shahrose_visa",
+        "Online · Kritee / Student Businesses": "group_count_kritee_businesses",
+        "Online · Sarthak / Global Businesses": "group_count_sarthak_global",
+        "Online · AI / Product / Automation": "group_count_ai_product",
+        "Online · Career / LinkedIn / Resume": "group_count_career_linkedin",
+        "Masterclass · Storytelling": "group_count_storytelling",
+        "Masterclass · Kevin Allen": "group_count_kevin_allen",
+        "Masterclass · Franco / IKIGAI": "group_count_franco_ikigai",
+        "Online · TIF / Innovation Fund": "group_count_tif",
+        "Online · VC / Fundraising": "group_count_vc_fundraising",
+        "Masterclass · Blockchain": "group_count_blockchain",
+        "Masterclass · Startup Pitfalls": "group_count_startup_pitfalls",
+        "Masterclass · Negotiation": "group_count_negotiation",
+        "Masterclass · Pricing Strategy": "group_count_pricing_strategy",
+        "Online · Parents AMA": "group_count_parents_ama",
+        "Online · China / Mandarin": "group_count_china_mandarin",
+        "Competition · Netflix CEO": "group_count_netflix_ceo",
+        "Competition · Instagram CEO": "group_count_instagram_ceo",
+        "Competition · Nike CEO": "group_count_nike_ceo",
+        "Competition · Elevator Pitch / Shark Tank": "group_count_elevator_pitch",
+        "Competition · Build Your Tetr Club": "group_count_tetr_club",
+        "Hackathon · Startup Hackathon": "group_count_startup_hackathon",
+        "Hackathon · AI Voice Agent": "group_count_ai_voice_hackathon",
+        "Hackathon · Finance": "group_count_finance_hackathon",
+        "Competition · Product / Pricing": "group_count_product_pricing_comp",
+        "Competition · $100 Startup": "group_count_100_startup",
+        "Competition · Video Challenge": "group_count_video_challenge",
+        "Competition · Quiz / TetrLocked": "group_count_quiz_tetrlocked",
+        "Competition · Capstone / Negotiation": "group_count_capstone_negotiation",
+        "Competition · Dropshipping": "group_count_dropshipping",
+        "Hackathon · Healthcare": "group_count_healthcare_hackathon",
+        "General · Introductions": "group_count_introductions",
+        "General · What’s Your Why": "group_count_whats_your_why",
+        "General · Story / Culture / Photo": "group_count_story_culture_photo",
+        "General · Fun / Games": "group_count_fun_games",
+        "General · Polls / Check-ins": "group_count_polls_checkins",
+        "Online · Other": "group_count_online_other",
+        "Competition · Other": "group_count_competition_other",
+        "Other": "group_count_other_group",
+    }
 
 
 def _ml_region_from_country(country: str) -> str:
@@ -8875,41 +9007,91 @@ def _ml_probability_band(prob: float) -> str:
 
 
 def _ml_student_reason(row: pd.Series) -> str:
+    """Human-readable reasons behind the payment probability."""
     reasons = []
+    prob = row.get("Payment Probability", None)
+    try:
+        if prob is not None and not pd.isna(prob):
+            reasons.append(f"model probability {float(prob) * 100:.1f}%")
+    except Exception:
+        pass
+
     if bool(row.get("community_acquired", False)):
         reasons.append("joined community")
     else:
-        reasons.append("not in community")
+        reasons.append("not yet in community")
+
     total = int(row.get("total_touchpoints", 0) or 0)
-    if total > 0:
-        reasons.append(f"{total} pre-payment touchpoint{'s' if total != 1 else ''}")
-    else:
-        reasons.append("no pre-payment activity")
     om = int(row.get("online_masterclass_count", 0) or 0)
     comp = int(row.get("competition_count", 0) or 0)
     gen = int(row.get("general_fun_count", 0) or 0)
+    winner = int(row.get("winner_spotlight_count", 0) or 0)
+    active_days = int(row.get("active_days", 0) or 0)
+    first_day = int(row.get("first_activity_day", 999) or 999)
+
+    if total > 0:
+        reasons.append(f"{total} pre-payment touchpoints across {active_days} active day{'s' if active_days != 1 else ''}")
+    else:
+        reasons.append("no pre-payment activity in the observation window")
+    if first_day != 999:
+        reasons.append(f"first activated on day {first_day + 1} from offer")
     if om:
-        reasons.append(f"{om} online/masterclass")
+        reasons.append(f"{om} online/masterclass touchpoint{'s' if om != 1 else ''}")
     if comp:
-        reasons.append(f"{comp} competition/hackathon")
+        reasons.append(f"{comp} competition/hackathon touchpoint{'s' if comp != 1 else ''}")
     if gen and not (om or comp):
-        reasons.append(f"{gen} general/fun only")
-    if int(row.get("winner_spotlight_count", 0) or 0) > 0:
-        reasons.append("winner/spotlight signal")
-    group_bits = []
-    for label, col in [
-        ("Pratham", "group_count_pratham"),
-        ("Garima", "group_count_garima"),
-        ("Shahrose/Visa", "group_count_shahrose"),
-        ("AI", "group_count_ai"),
-        ("Founder/Startup", "group_count_founder"),
-        ("Career", "group_count_career"),
-    ]:
-        if int(row.get(col, 0) or 0) > 0:
-            group_bits.append(label)
-    if group_bits:
-        reasons.append("attended " + ", ".join(group_bits[:3]))
-    return "; ".join(reasons[:6])
+        reasons.append(f"{gen} general/fun-only touchpoint{'s' if gen != 1 else ''}")
+    if winner > 0:
+        reasons.append(f"{winner} winner/spotlight signal{'s' if winner != 1 else ''}")
+
+    group_map = _ml_event_group_feature_map()
+    hit_groups = []
+    for group_name, count_col in group_map.items():
+        if int(row.get(count_col, 0) or 0) > 0:
+            label = group_name.replace("Online · ", "").replace("Masterclass · ", "").replace("Competition · ", "").replace("Hackathon · ", "")
+            hit_groups.append(label)
+    if hit_groups:
+        reasons.append("key event groups: " + ", ".join(hit_groups[:4]))
+
+    if bool(row.get("high_quality_signal", False)):
+        reasons.append("strong meaningful engagement signal")
+    elif bool(row.get("low_quality_activity_only", False)):
+        reasons.append("activity is mostly low-intent/general")
+    return "; ".join(reasons[:8])
+
+
+def _ml_recommended_actions(row: pd.Series) -> str:
+    """Action suggestions for counsellors/admissions team to improve conversion."""
+    actions = []
+    total = int(row.get("total_touchpoints", 0) or 0)
+    om = int(row.get("online_masterclass_count", 0) or 0)
+    comp = int(row.get("competition_count", 0) or 0)
+    gen = int(row.get("general_fun_count", 0) or 0)
+    prob = float(row.get("Payment Probability", 0) or 0)
+
+    if not bool(row.get("community_acquired", False)):
+        actions.append("move into community / WA flow first")
+    if total == 0:
+        actions.append("invite to Welcome Webinar or Life at Tetr session")
+    if om == 0:
+        actions.append("push one high-conversion online/masterclass touchpoint")
+    if comp == 0:
+        actions.append("invite to a repeatable challenge/hackathon to create commitment")
+    if gen > 0 and om == 0 and comp == 0:
+        actions.append("upgrade from general/fun activity to meaningful event participation")
+    if int(row.get("group_count_welcome_webinar", 0) or 0) == 0:
+        actions.append("send Welcome Webinar recording/invite")
+    if int(row.get("group_count_life_at_tetr", 0) or 0) == 0:
+        actions.append("route to Life at Tetr / Student Experience proof")
+    if int(row.get("group_count_career_linkedin", 0) or 0) == 0 and prob < 0.65:
+        actions.append("offer career/LinkedIn/resume session as practical value proof")
+    if int(row.get("group_count_pratham_founder", 0) or 0) == 0 and prob >= 0.40:
+        actions.append("use Pratham/Founder’s Playbook as founder-led conversion nudge")
+    if int(row.get("group_count_shahrose_visa", 0) or 0) == 0 and clean_text(row.get("Program", "")).upper() == "UG":
+        actions.append("address visa/travel/next-step concerns")
+    if not actions:
+        actions.append("keep warm with counsellor follow-up and deadline/payment clarity")
+    return "; ".join(actions[:5])
 
 
 def _ml_tetrx_payment_lookup(data: dict) -> dict:
@@ -9096,17 +9278,7 @@ def build_ml_prediction_dataset(data: dict):
 
     rows = []
     event_rows = []
-    fixed_groups = {
-        "Pratham Events": "group_count_pratham",
-        "Garima Events": "group_count_garima",
-        "Shahrose / Visa / Travel": "group_count_shahrose",
-        "Welcome / Harshit Events": "group_count_welcome",
-        "AI / Automation Events": "group_count_ai",
-        "Founder / Startup / VC": "group_count_founder",
-        "Career / Communication": "group_count_career",
-        "Competitions / Hackathons": "group_count_competitions_group",
-        "General / Fun": "group_count_general_fun_group",
-    }
+    fixed_groups = _ml_event_group_feature_map()
 
     for idx, r in base.iterrows():
         sid = clean_text(r.get("student_id", ""))
@@ -9343,7 +9515,7 @@ def build_ml_group_conversion_intelligence(train_df: pd.DataFrame, event_rows_df
 
 
 def _ml_feature_columns(df: pd.DataFrame):
-    numeric_cols = [c for c in [
+    base_numeric = [
         "community_acquired", "total_touchpoints", "active_days", "first_activity_day", "last_activity_day",
         "touchpoints_week1", "touchpoints_week2", "touchpoints_week3", "touchpoints_week4",
         "online_masterclass_count", "competition_count", "general_fun_count", "other_count",
@@ -9354,11 +9526,13 @@ def _ml_feature_columns(df: pd.DataFrame):
         "no_activity_in_community", "active_out_community", "activated_week1",
         "activated_week2", "activated_first30", "early_meaningful_activity",
         "high_quality_signal", "low_quality_activity_only",
-        "group_count_pratham", "group_count_garima", "group_count_shahrose", "group_count_welcome",
-        "group_count_ai", "group_count_founder", "group_count_career", "group_count_competitions_group", "group_count_general_fun_group",
-        "group_attended_pratham", "group_attended_garima", "group_attended_shahrose", "group_attended_welcome",
-        "group_attended_ai", "group_attended_founder", "group_attended_career", "group_attended_competitions_group", "group_attended_general_fun_group",
-    ] if c in df.columns]
+    ]
+    # Include every stable repetitive event-group count/flag created by
+    # _ml_event_group_feature_map(), plus future group features if added later.
+    group_numeric = [c for c in df.columns if str(c).startswith("group_count_") or str(c).startswith("group_attended_")]
+    numeric_cols = [c for c in base_numeric + group_numeric if c in df.columns]
+    # Preserve order while removing duplicates.
+    numeric_cols = list(dict.fromkeys(numeric_cols))
     categorical_cols = [c for c in ["Program", "Batch", "Course", "Country", "Region", "Income", "Counsellor", "Community Acquired"] if c in df.columns]
     return numeric_cols, categorical_cols
 
@@ -9662,19 +9836,24 @@ def score_ml_students(model, feature_df: pd.DataFrame, threshold_mode: str = "Ba
     out["Threshold Mode"] = threshold_mode
     out["Predicted Conversion"] = out["Payment Probability"].map(lambda p: _ml_prediction_label(p, threshold))
     out["Prediction Band"] = out["Payment Probability"].map(_ml_probability_band)
-    out["Top Factors"] = out.apply(_ml_student_reason, axis=1)
+    out["Why This Probability"] = out.apply(_ml_student_reason, axis=1)
+    out["Recommended Conversion Actions"] = out.apply(_ml_recommended_actions, axis=1)
+    out["Top Factors"] = out["Why This Probability"]
     return out.sort_values("Payment Probability", ascending=False).reset_index(drop=True)
 
 
 def render_ml_predictions_page(data):
-    st.subheader("ML Predictions")
-    st.caption("Payment prediction uses pre-payment behavior only. Refunded students are included as converted because they paid once; post-payment behavior is still excluded and can be used later for refund-risk prediction.")
+    st.subheader("Tetr ML Prediction Dashboard")
+    st.caption(
+        "Predicts payment/conversion probability from pre-payment behavior only. "
+        "Refunded students are included as converted because they paid once; post-payment behavior is excluded and can be used later for refund-risk prediction."
+    )
 
     if not SKLEARN_AVAILABLE:
         st.error("scikit-learn is not installed in this environment. Add `scikit-learn` to requirements.txt to enable ML training and scoring.")
         return
 
-    with st.spinner("Building pre-payment feature set and training models..."):
+    with st.spinner("Building pre-payment feature set, grouping repeated events, and training models..."):
         feature_df, train_df, event_intel_df, group_intel_df = build_ml_prediction_dataset(data)
         model, perf_df, confusion_df, importance_df, error_audit_df, err = train_ml_payment_models(train_df, preferred_model="Gradient Boosting")
         program_perf_df = _ml_program_model_summary(train_df)
@@ -9689,7 +9868,7 @@ def render_ml_predictions_page(data):
         "Prediction threshold mode",
         ["Balanced", "High Recall", "High Precision"],
         index=0,
-        help="Balanced uses the tuned F1 threshold. High Recall lowers the threshold to catch more likely converters. High Precision raises the threshold to reduce false positives.",
+        help="Balanced uses the tuned F1 threshold. High Recall catches more possible converters. High Precision reduces false positives.",
         key="ml_threshold_mode",
     )
     scored_df = score_ml_students(model, feature_df, threshold_mode=threshold_mode) if model is not None else pd.DataFrame()
@@ -9706,27 +9885,102 @@ def render_ml_predictions_page(data):
     primary_threshold = float(getattr(model, "ml_base_threshold_", getattr(model, "ml_threshold_", 0.50))) if model is not None else 0.50
     active_threshold = _ml_threshold_for_mode(primary_threshold, threshold_mode) if model is not None else 0.50
 
-    m1, m2, m3, m4 = st.columns(4)
+    unpaid_df = scored_df[scored_df.get("Actual Paid", pd.Series(0, index=scored_df.index)).astype(int).eq(0)].copy() if not scored_df.empty else pd.DataFrame()
+    likely_unpaid = int(unpaid_df.get("Predicted Conversion", pd.Series(dtype=str)).astype(str).eq("Likely to Pay").sum()) if not unpaid_df.empty else 0
+    high_intent_unpaid = int(unpaid_df.get("Prediction Band", pd.Series(dtype=str)).astype(str).isin(["Very High Intent", "High Intent"]).sum()) if not unpaid_df.empty else 0
+    avg_unpaid_prob = float(unpaid_df.get("Payment Probability %", pd.Series(dtype=float)).mean()) if not unpaid_df.empty else 0.0
+
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Students Scored", f"{len(feature_df):,}")
     m2.metric("Training Rows", f"{included:,}", delta=f"{paid_rows:,} converted")
-    m3.metric("Refunds Included", f"{refund_included:,}")
-    m4.metric("Current Conversion Rate", f"{(paid_rows / included * 100) if included else 0:.1f}%")
-    st.caption(f"Primary scoring model: {primary_name}. Balanced threshold: {primary_threshold:.3f}; active {threshold_mode} threshold: {active_threshold:.3f}. Gradient Boosting is used as the primary model when it trains successfully; other models remain visible for comparison.")
+    m3.metric("Unpaid Scored", f"{len(unpaid_df):,}")
+    m4.metric("High Intent Unpaid", f"{high_intent_unpaid:,}", delta=f"{likely_unpaid:,} likely to pay")
+    m5.metric("Avg Unpaid Probability", f"{avg_unpaid_prob:.1f}%")
+    st.caption(
+        f"Primary scoring model: {primary_name}. Balanced threshold: {primary_threshold:.3f}; active {threshold_mode} threshold: {active_threshold:.3f}. "
+        "The selected model is evaluated with train/test split, then refit on all historical labelled rows before scoring current unpaid students."
+    )
 
-    st.markdown("### Prediction Bands")
-    band_order = ["Very High Intent", "High Intent", "Medium Intent", "Low Intent", "Cold", "Not scored"]
-    band_df = pred_source.groupby("Prediction Band", as_index=False).size().rename(columns={"size": "Students"})
-    band_df["Prediction Band"] = pd.Categorical(band_df["Prediction Band"], categories=band_order, ordered=True)
-    band_df = band_df.sort_values("Prediction Band")
-    if not band_df.empty:
-        fig = px.bar(band_df, x="Prediction Band", y="Students", text="Students", title="Predicted Payment Intent Bands")
-        fig.update_traces(marker_color=GREEN_2, textposition="outside")
-        st.plotly_chart(nice_layout(fig, height=330), use_container_width=True, key="ml_prediction_bands")
+    if not pred_source.empty:
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.markdown("### All Student Prediction Bands")
+            band_order = ["Very High Intent", "High Intent", "Medium Intent", "Low Intent", "Cold", "Not scored"]
+            band_df = pred_source.groupby("Prediction Band", as_index=False).size().rename(columns={"size": "Students"})
+            band_df["Prediction Band"] = pd.Categorical(band_df["Prediction Band"], categories=band_order, ordered=True)
+            band_df = band_df.sort_values("Prediction Band")
+            fig = px.bar(band_df, x="Prediction Band", y="Students", text="Students", title="All Students by Payment Intent")
+            fig.update_traces(marker_color=GREEN_2, textposition="outside")
+            st.plotly_chart(nice_layout(fig, height=330), use_container_width=True, key="ml_prediction_bands")
+        with c2:
+            st.markdown("### Unpaid Student Prediction Bands")
+            if not unpaid_df.empty:
+                unpaid_band_df = unpaid_df.groupby("Prediction Band", as_index=False).size().rename(columns={"size": "Unpaid Students"})
+                unpaid_band_df["Prediction Band"] = pd.Categorical(unpaid_band_df["Prediction Band"], categories=band_order, ordered=True)
+                unpaid_band_df = unpaid_band_df.sort_values("Prediction Band")
+                fig = px.bar(unpaid_band_df, x="Prediction Band", y="Unpaid Students", text="Unpaid Students", title="Unpaid Students by Payment Intent")
+                fig.update_traces(marker_color=GREEN_3, textposition="outside")
+                st.plotly_chart(nice_layout(fig, height=330), use_container_width=True, key="ml_unpaid_prediction_bands")
+            else:
+                st.info("No unpaid students available for scoring.")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Student Predictions", "Model Performance", "Event Conversion", "Feature Importance", "Error Audit", "Training Data Audit"])
+    tabs = st.tabs([
+        "Unpaid Conversion Pipeline",
+        "All Student Predictions",
+        "Model Performance",
+        "Event Group Intelligence",
+        "Event-Level Intelligence",
+        "Feature Importance",
+        "Error Audit",
+        "Training Data Audit",
+    ])
 
-    with tab1:
-        st.markdown("#### Student-level payment probability")
+    with tabs[0]:
+        st.markdown("#### Unpaid students — payment probability and conversion actions")
+        st.caption("This is the operational view: the model is trained on all historical labelled data after train/test evaluation, then applied to unpaid students only.")
+        if unpaid_df.empty:
+            st.info("No unpaid student predictions are available.")
+        else:
+            program_values = sorted([x for x in unpaid_df["Program"].dropna().astype(str).unique() if x]) if "Program" in unpaid_df.columns else []
+            program_filter = st.multiselect("Program", program_values, default=program_values, key="ml_unpaid_program_filter")
+            band_values = ["Very High Intent", "High Intent", "Medium Intent", "Low Intent", "Cold"]
+            band_filter = st.multiselect("Intent Band", band_values, default=["Very High Intent", "High Intent", "Medium Intent"], key="ml_unpaid_band_filter")
+            show_df = unpaid_df.copy()
+            if program_filter and "Program" in show_df.columns:
+                show_df = show_df[show_df["Program"].astype(str).isin(program_filter)]
+            if band_filter and "Prediction Band" in show_df.columns:
+                show_df = show_df[show_df["Prediction Band"].astype(str).isin(band_filter)]
+            cols = [c for c in [
+                "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Counsellor", "Community Acquired",
+                "Payment Probability %", "Prediction Band", "Predicted Conversion", "Model Threshold",
+                "total_touchpoints", "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
+                "Why This Probability", "Recommended Conversion Actions", "Offered Date", "Deadline", "Observation Cutoff"
+            ] if c in show_df.columns]
+            st.dataframe(show_df[cols].sort_values("Payment Probability %", ascending=False), use_container_width=True, height=620, hide_index=True, key="ml_unpaid_conversion_pipeline")
+
+            st.markdown("##### Priority segments")
+            seg = show_df.copy()
+            if not seg.empty:
+                seg["Priority Segment"] = np.select(
+                    [
+                        seg["Payment Probability"].astype(float).ge(0.80),
+                        seg["Payment Probability"].astype(float).ge(0.65),
+                        seg["Payment Probability"].astype(float).ge(0.40),
+                    ],
+                    ["Immediate payment follow-up", "High-intent nurture", "Medium-intent activation"],
+                    default="Low-intent reactivation",
+                )
+                seg_summary = seg.groupby("Priority Segment", as_index=False).agg(
+                    Students=("student_id", "nunique"),
+                    Avg_Probability=("Payment Probability %", "mean"),
+                    Avg_Touchpoints=("total_touchpoints", "mean"),
+                )
+                seg_summary["Avg_Probability"] = seg_summary["Avg_Probability"].round(1)
+                seg_summary["Avg_Touchpoints"] = seg_summary["Avg_Touchpoints"].round(2)
+                st.dataframe(seg_summary.sort_values("Avg_Probability", ascending=False), use_container_width=True, hide_index=True, key="ml_unpaid_priority_segments")
+
+    with tabs[1]:
+        st.markdown("#### All student-level payment probabilities")
         if scored_df.empty:
             st.info("Student probability scoring is unavailable until a model is trained successfully.")
         else:
@@ -9735,6 +9989,7 @@ def render_ml_predictions_page(data):
             band_values = ["Very High Intent", "High Intent", "Medium Intent", "Low Intent", "Cold"]
             band_filter = st.multiselect("Prediction Band", band_values, default=band_values, key="ml_band_filter")
             conversion_filter = st.multiselect("Predicted Conversion", ["Likely to Pay", "Needs Nurture"], default=["Likely to Pay", "Needs Nurture"], key="ml_conversion_filter")
+            paid_filter = st.multiselect("Actual Paid", ["Paid/Converted", "Unpaid"], default=["Paid/Converted", "Unpaid"], key="ml_actual_paid_filter")
             show_df = scored_df.copy()
             if program_filter and "Program" in show_df.columns:
                 show_df = show_df[show_df["Program"].astype(str).isin(program_filter)]
@@ -9742,19 +9997,28 @@ def render_ml_predictions_page(data):
                 show_df = show_df[show_df["Prediction Band"].astype(str).isin(band_filter)]
             if conversion_filter and "Predicted Conversion" in show_df.columns:
                 show_df = show_df[show_df["Predicted Conversion"].astype(str).isin(conversion_filter)]
+            if paid_filter and "Actual Paid" in show_df.columns:
+                paid_mask = show_df["Actual Paid"].astype(int).eq(1)
+                keep = pd.Series(False, index=show_df.index)
+                if "Paid/Converted" in paid_filter:
+                    keep = keep | paid_mask
+                if "Unpaid" in paid_filter:
+                    keep = keep | ~paid_mask
+                show_df = show_df[keep]
             cols = [c for c in [
                 "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Community Acquired",
-                "Payment Probability %", "Prediction Band", "Predicted Conversion", "Threshold Mode", "Model Threshold", "Actual Paid", "total_touchpoints", "online_masterclass_count",
-                "competition_count", "general_fun_count", "winner_spotlight_count", "Top Factors", "Offered Date", "Observation Cutoff"
+                "Payment Probability %", "Prediction Band", "Predicted Conversion", "Threshold Mode", "Model Threshold", "Actual Paid",
+                "total_touchpoints", "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
+                "Why This Probability", "Recommended Conversion Actions", "Offered Date", "Observation Cutoff"
             ] if c in show_df.columns]
             display = show_df[cols].copy()
             if "Actual Paid" in display.columns:
                 display["Actual Paid"] = display["Actual Paid"].map(lambda x: "Yes" if int(x) == 1 else "No")
             st.dataframe(display, use_container_width=True, height=560, hide_index=True, key="ml_student_predictions_table")
 
-    with tab2:
+    with tabs[2]:
         st.markdown("#### Train/test model performance")
-        st.caption("Models are trained on historical conversion outcomes using a stratified train/test split. Refunded students are included as converted. Precision shows how reliable paid predictions are; recall shows how many actual converted students the model catches. Threshold is tuned on training predictions, then metrics are calculated on the held-out test set.")
+        st.caption("Models are trained on historical conversion outcomes using stratified train/test split. The selected model is then refit on all labelled data before live unpaid scoring.")
         if perf_df is not None and not perf_df.empty:
             st.dataframe(perf_df, use_container_width=True, hide_index=True, key="ml_model_performance_table")
             metric_long = perf_df.melt(id_vars="Model", value_vars=[c for c in ["Accuracy", "Balanced Accuracy", "Precision", "Recall", "F1", "ROC AUC"] if c in perf_df.columns], var_name="Metric", value_name="Score")
@@ -9767,52 +10031,68 @@ def render_ml_predictions_page(data):
             st.markdown("#### Confusion matrix by model")
             st.dataframe(confusion_df, use_container_width=True, hide_index=True, key="ml_confusion_table")
         st.markdown("#### Separate UG / PG model diagnostic")
-        st.caption("This trains program-level diagnostic models separately. Use this to check whether UG and PG behave differently before deciding to route live scoring through separate models.")
         if program_perf_df is not None and not program_perf_df.empty:
             st.dataframe(program_perf_df, use_container_width=True, hide_index=True, key="ml_program_perf_table")
         else:
             st.info("Program-level model performance is unavailable.")
 
-    with tab3:
-        st.markdown("#### Event conversion intelligence")
-        st.caption("This is correlation, not proof of causation. It compares students who attended an event before payment/cutoff with students who did not attend it. Refunded students are counted as converted here as well.")
-        min_att = st.slider("Minimum attended students", 1, 100, 10, key="ml_min_attended")
+    with tabs[3]:
+        st.markdown("#### Repetitive event-group conversion intelligence")
+        st.caption("Groups combine repeated sessions across batches using speaker/topic/challenge keywords. This section is correlation, not causation, but these same group features are included in the ML model.")
+        min_att = st.slider("Minimum attended students", 1, 100, 10, key="ml_group_min_attended")
         gdf = group_intel_df[group_intel_df["Attended Students"].ge(min_att)].copy() if group_intel_df is not None and not group_intel_df.empty else pd.DataFrame()
-        edf = event_intel_df[event_intel_df["Attended Students"].ge(min_att)].copy() if event_intel_df is not None and not event_intel_df.empty else pd.DataFrame()
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.markdown("##### Event groups connected with conversion")
-            if not gdf.empty:
-                st.dataframe(gdf, use_container_width=True, hide_index=True, height=360, key="ml_group_conversion_table")
-            else:
-                st.info("No event group rows meet the selected attendance threshold.")
-        with c2:
-            st.markdown("##### Top event-group lift")
-            if not gdf.empty:
-                chart_df = gdf.sort_values("Lift (pp)", ascending=False).head(10)
-                fig = px.bar(chart_df, x="Lift (pp)", y="Event Group", orientation="h", text="Lift (pp)", title="Conversion Lift by Event Group")
+        if not gdf.empty:
+            gdf = gdf.sort_values(["Lift (pp)", "Attended Students"], ascending=[False, False])
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.dataframe(gdf, use_container_width=True, hide_index=True, height=480, key="ml_group_conversion_table")
+            with c2:
+                chart_df = gdf.head(14).sort_values("Lift (pp)", ascending=True)
+                fig = px.bar(chart_df, x="Lift (pp)", y="Event Group", orientation="h", text="Lift (pp)", title="Conversion Lift by Repeated Event Group")
                 fig.update_traces(marker_color=GREEN_2)
-                st.plotly_chart(nice_layout(fig, height=360), use_container_width=True, key="ml_group_lift_chart")
-        st.markdown("##### Event-level conversion table")
+                st.plotly_chart(nice_layout(fig, height=480), use_container_width=True, key="ml_group_lift_chart")
+        else:
+            st.info("No event group rows meet the selected attendance threshold.")
+
+        st.markdown("##### Event group feature coverage")
+        group_feature_cols = [c for c in feature_df.columns if c.startswith("group_count_")]
+        if group_feature_cols:
+            cov_rows = []
+            inverse_map = {v: k for k, v in _ml_event_group_feature_map().items()}
+            for c in group_feature_cols:
+                attended_students = int(pd.to_numeric(feature_df[c], errors="coerce").fillna(0).gt(0).sum())
+                cov_rows.append({"Event Group": inverse_map.get(c, c.replace("group_count_", "").replace("_", " ").title()), "Students with Signal": attended_students})
+            cov = pd.DataFrame(cov_rows).sort_values("Students with Signal", ascending=False)
+            st.dataframe(cov, use_container_width=True, hide_index=True, height=360, key="ml_group_feature_coverage")
+
+    with tabs[4]:
+        st.markdown("#### Event-level conversion intelligence")
+        st.caption("Specific event rows before payment/cutoff, shown after grouping to help inspect which individual sessions are lifting conversion.")
+        min_att_event = st.slider("Minimum event attendees", 1, 100, 10, key="ml_event_min_attended")
+        edf = event_intel_df[event_intel_df["Attended Students"].ge(min_att_event)].copy() if event_intel_df is not None and not event_intel_df.empty else pd.DataFrame()
         if not edf.empty:
-            st.dataframe(edf.head(150), use_container_width=True, hide_index=True, height=520, key="ml_event_conversion_table")
+            group_values = sorted([x for x in edf["Event Group"].dropna().astype(str).unique() if x])
+            group_filter = st.multiselect("Event Group", group_values, default=group_values, key="ml_event_group_filter")
+            if group_filter:
+                edf = edf[edf["Event Group"].astype(str).isin(group_filter)]
+            st.dataframe(edf.sort_values(["Lift (pp)", "Attended Students"], ascending=[False, False]).head(250), use_container_width=True, hide_index=True, height=560, key="ml_event_conversion_table")
         else:
             st.info("No event rows meet the selected attendance threshold.")
 
-    with tab4:
+    with tabs[5]:
         st.markdown("#### Model factor importance")
         if importance_df is not None and not importance_df.empty:
             st.dataframe(importance_df, use_container_width=True, hide_index=True, key="ml_feature_importance_table")
-            chart_df = importance_df.head(15).copy().sort_values("Importance", ascending=True)
+            chart_df = importance_df.head(20).copy().sort_values("Importance", ascending=True)
             fig = px.bar(chart_df, x="Importance", y="Feature", orientation="h", title="Top Model Factors")
             fig.update_traces(marker_color=GREEN_2)
-            st.plotly_chart(nice_layout(fig, height=480), use_container_width=True, key="ml_feature_importance_chart")
+            st.plotly_chart(nice_layout(fig, height=560), use_container_width=True, key="ml_feature_importance_chart")
         else:
             st.info("Feature importance is unavailable for the selected model.")
 
-    with tab5:
+    with tabs[6]:
         st.markdown("#### False positive / false negative audit")
-        st.caption("These are held-out test rows where the model prediction differed from the actual conversion label. Use this to understand confusing patterns and refine features.")
+        st.caption("Held-out test rows where model prediction differed from actual conversion label.")
         if error_audit_df is not None and not error_audit_df.empty:
             model_values = sorted(error_audit_df["Model"].dropna().astype(str).unique())
             default_model = [primary_name] if primary_name in model_values else model_values
@@ -9827,14 +10107,14 @@ def render_ml_predictions_page(data):
         else:
             st.info("No held-out prediction errors available, or model training did not complete.")
 
-    with tab6:
+    with tabs[7]:
         st.markdown("#### Training feature dataset audit")
-        st.caption("Refund rows are included as converted because they paid once. Behavior columns are still built only up to payment date for converted students and first-30-days cutoff for non-converted students.")
+        st.caption("Refund rows are included as converted. Behavior columns are built only up to payment date for converted students and first-30-days cutoff for non-converted students.")
         audit_cols = [c for c in [
             "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Income", "Counsellor", "Community Acquired",
             "Actual Paid", "Refund / Later Refunded", "training_included", "Offered Date", "Deadline", "Payment Date", "Observation Cutoff",
             "total_touchpoints", "active_days", "observation_days", "touchpoints_per_observed_day", "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count", "meaningful_touchpoints", "general_only",
-            "group_count_pratham", "group_count_garima", "group_count_shahrose", "group_count_ai", "group_count_founder", "group_count_career"
+            "group_count_welcome_webinar", "group_count_life_at_tetr", "group_count_garima_learning", "group_count_pratham_founder", "group_count_tarun_cofounder", "group_count_amitoj_opportunities", "group_count_shahrose_visa", "group_count_career_linkedin", "group_count_netflix_ceo", "group_count_startup_hackathon", "group_count_tetr_club", "group_count_ai_voice_hackathon"
         ] if c in feature_df.columns]
         st.dataframe(feature_df[audit_cols], use_container_width=True, height=560, hide_index=True, key="ml_training_audit_table")
 
@@ -9845,7 +10125,7 @@ def main():
 
     with st.sidebar:
         st.markdown("## 🧭 Navigation")
-        default_pages = ["Overview", "Recent Activity", "Success Metrics", "Student Profile", "ML Predictions"]
+        default_pages = ["Overview", "Recent Activity", "Success Metrics", "Student Profile", "ML Prediction Dashboard"]
         default_index = default_pages.index(st.session_state.get("nav_page", "Overview")) if st.session_state.get("nav_page", "Overview") in default_pages else 0
         page = st.radio("Go to", default_pages, index=default_index, label_visibility="collapsed", key="nav")
         st.session_state["nav_page"] = page
@@ -9875,7 +10155,7 @@ def main():
         render_success_metrics_page(data)
     elif page == "Student Profile":
         render_student_profile(data)
-    elif page == "ML Predictions":
+    elif page == "ML Prediction Dashboard":
         render_ml_predictions_page(data)
 
 
