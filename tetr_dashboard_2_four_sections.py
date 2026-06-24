@@ -9021,9 +9021,16 @@ def _ml_student_reason(row: pd.Series) -> str:
     """Human-readable reasons behind the payment probability."""
     reasons = []
     prob = row.get("Payment Probability", None)
+    base_prob = row.get("Base ML Probability", None)
+    uplift = row.get("Positive Engagement Uplift", None)
     try:
         if prob is not None and not pd.isna(prob):
-            reasons.append(f"model probability {float(prob) * 100:.1f}%")
+            if base_prob is not None and not pd.isna(base_prob):
+                reasons.append(f"final probability {float(prob) * 100:.1f}% (base ML {float(base_prob) * 100:.1f}% + positive engagement signals)")
+            else:
+                reasons.append(f"model probability {float(prob) * 100:.1f}%")
+        if uplift is not None and not pd.isna(uplift) and float(uplift) > 0:
+            reasons.append(f"positive engagement uplift +{float(uplift) * 100:.1f} pts")
     except Exception:
         pass
 
@@ -9056,7 +9063,12 @@ def _ml_student_reason(row: pd.Series) -> str:
     eligible = int(row.get("eligible_events", 0) or 0)
     eligible_attended = int(row.get("eligible_attended_events", 0) or 0)
     if eligible > 0:
-        reasons.append(f"attended {eligible_attended}/{eligible} eligible journey events ({float(row.get('eligible_attendance_rate', 0) or 0) * 100:.1f}%)")
+        elig_rate = float(row.get('eligible_attendance_rate', 0) or 0)
+        if eligible_attended > 0:
+            if eligible >= 4 and elig_rate >= 0.50:
+                reasons.append(f"strong eligible-journey signal: attended {eligible_attended}/{eligible} eligible events ({elig_rate * 100:.1f}%)")
+            else:
+                reasons.append(f"attended {eligible_attended} eligible journey event{'s' if eligible_attended != 1 else ''}")
     eq = clean_text(row.get("Engagement Quality", ""))
     if eq:
         reasons.append(f"{eq.lower()} by weighted engagement-quality rules")
@@ -9108,10 +9120,13 @@ def _ml_recommended_actions(row: pd.Series) -> str:
         actions.append("push one high-conversion online/masterclass touchpoint")
     if comp == 0:
         actions.append("invite to a repeatable challenge/hackathon to create commitment")
-    if float(row.get("eligible_attendance_rate", 0) or 0) < 0.25 and int(row.get("eligible_events", 0) or 0) >= 3:
-        actions.append("increase journey attendance: student has attended a low share of eligible events")
-    if float(row.get("eligible_meaningful_attendance_rate", 0) or 0) < 0.25 and int(row.get("eligible_meaningful_events", 0) or 0) >= 2:
-        actions.append("push one high-impact eligible event/masterclass or competition")
+    # Eligibility is upgrade-only: low eligible attendance should not downgrade or
+    # create a negative action. If eligible attendance is strong, use it as a
+    # positive conversion hook.
+    if float(row.get("eligible_attendance_rate", 0) or 0) >= 0.70 and int(row.get("eligible_attended_events", 0) or 0) >= 3:
+        actions.append("use strong journey attendance as conversion proof in follow-up")
+    if float(row.get("eligible_meaningful_attendance_rate", 0) or 0) >= 0.50 and int(row.get("eligible_meaningful_attended_events", 0) or 0) >= 1:
+        actions.append("reference their meaningful event participation in payment nudge")
     if gen > 0 and om == 0 and comp == 0:
         actions.append("upgrade from general/fun activity to meaningful event participation")
     if int(row.get("active_after_deadline_only", 0) or 0) > 0:
@@ -10029,46 +10044,31 @@ def build_ml_group_conversion_intelligence(train_df: pd.DataFrame, event_rows_df
 
 
 def _ml_feature_columns(df: pd.DataFrame):
+    # Keep the statistical model focused on factual, payment-safe activity counts.
+    # Engagement Quality / high-impact grouping / eligible-event ratios are applied
+    # later as POSITIVE-ONLY scoring uplift, so noisy historical samples cannot
+    # accidentally learn them as negative penalties and push strong students to 0%.
     base_numeric = [
-        "community_acquired", "total_touchpoints", "active_days", "first_activity_day", "last_activity_day",
+        "community_acquired",
+        "total_touchpoints", "active_days", "first_activity_day", "last_activity_day",
         "touchpoints_week1", "touchpoints_week2", "touchpoints_week3", "touchpoints_week4",
-        "first30_touchpoints", "first30_active_days", "online_masterclass_count", "competition_count", "general_fun_count", "other_count",
-        "winner_spotlight_count", "has_activity", "has_online_masterclass", "has_competition",
-        "has_winner_spotlight", "missing_offered_date",
-        # Display-only raw eligible denominators are intentionally not used directly
-        # by the model because they made predictions too strict. The model uses
-        # supportive/capped eligible signals plus attended counts instead.
-        "eligible_data_available", "eligible_attended_events", "eligible_attendance_signal",
-        "eligible_meaningful_data_available", "eligible_meaningful_attended_events", "eligible_meaningful_signal",
-        "eligible_weighted_attended_score", "weighted_engagement_signal",
-        "post_deadline_eligible_data_available", "post_deadline_attended_eligible_events", "post_deadline_eligible_signal", "post_deadline_weighted_engagement_signal",
-        "engagement_quality_score", "weighted_engagement_score", "post_deadline_weighted_engagement_score", "safe_weighted_engagement_score_including_late",
-        "high_impact_group_touchpoints", "high_impact_group_diversity", "has_high_impact_group", "high_impact_group_intensity", "post_deadline_high_impact_group_touchpoints", "has_post_deadline_high_impact_group",
+        "first30_touchpoints", "first30_active_days",
+        "online_masterclass_count", "competition_count", "general_fun_count", "other_count",
+        "winner_spotlight_count", "has_activity", "has_online_masterclass", "has_competition", "has_winner_spotlight",
+        # Eligibility is deliberately NOT used by the base ML model.
+        # It is applied later as a positive-only uplift/floor, so low eligible
+        # attendance can never downgrade a student's probability.
         "observation_days", "touchpoints_per_observed_day", "touchpoints_per_active_day",
-        "meaningful_touchpoints", "online_competition_count", "general_only",
-        "no_activity_in_community", "active_out_community", "activated_week1",
-        "activated_week2", "activated_first30", "early_meaningful_activity",
-        "high_quality_signal", "low_quality_activity_only",
+        "meaningful_touchpoints", "online_competition_count",
+        "activated_week1", "activated_week2", "activated_first30", "early_meaningful_activity",
         "post_deadline_touchpoints", "post_deadline_active_days", "reactivated_after_deadline",
-        "reactivation_gap_days", "last_post_deadline_activity_day",
         "post_deadline_online_masterclass_count", "post_deadline_competition_count",
         "post_deadline_general_fun_count", "post_deadline_meaningful_touchpoints",
-        "post_deadline_share", "active_after_deadline_only", "reactivation_quality_signal",
-        "safe_total_touchpoints_including_late", "safe_meaningful_touchpoints_including_late",
+        "reactivation_quality_signal", "safe_total_touchpoints_including_late", "safe_meaningful_touchpoints_including_late",
     ]
-    # Include every stable repetitive event-group count/flag created by
-    # _ml_event_group_feature_map(), plus future group features if added later.
-    group_numeric = [
-        c for c in df.columns
-        if str(c).startswith("group_count_")
-        or str(c).startswith("group_attended_")
-        or str(c).startswith("post_deadline_group_count_")
-        or str(c).startswith("post_deadline_group_attended_")
-    ]
-    numeric_cols = [c for c in base_numeric + group_numeric if c in df.columns]
-    # Preserve order while removing duplicates.
+    numeric_cols = [c for c in base_numeric if c in df.columns]
     numeric_cols = list(dict.fromkeys(numeric_cols))
-    categorical_cols = [c for c in ["Program", "Batch", "Course", "Country", "Region", "Income", "Counsellor", "Community Acquired", "Engagement Quality"] if c in df.columns]
+    categorical_cols = [c for c in ["Program", "Batch", "Course", "Country", "Region", "Income", "Counsellor", "Community Acquired"] if c in df.columns]
     return numeric_cols, categorical_cols
 
 
@@ -10362,6 +10362,192 @@ def _ml_feature_importance(pipe, numeric_cols, categorical_cols) -> pd.DataFrame
         return pd.DataFrame()
 
 
+
+def _ml_positive_engagement_uplift(row: pd.Series) -> float:
+    """Bounded positive-only uplift from known intent signals.
+
+    This is intentionally applied after the base ML model. The base model can
+    learn broad conversion patterns, while engagement-quality rules, repeated
+    high-impact event groups, eligible meaningful attendance, and winner/spotlight
+    signals can only increase the displayed conversion probability. They never
+    reduce a student's score.
+    """
+    def _num(name, default=0.0):
+        try:
+            return float(row.get(name, default) or 0.0)
+        except Exception:
+            return float(default)
+
+    uplift = 0.0
+    total = _num("total_touchpoints")
+    active_days = _num("active_days")
+    om = _num("online_masterclass_count")
+    comp = _num("competition_count")
+    winner = _num("winner_spotlight_count")
+    hi = _num("high_impact_group_touchpoints")
+    hi_div = _num("high_impact_group_diversity")
+    elig = _num("eligible_attended_events")
+    elig_total = _num("eligible_events")
+    elig_rate = _num("eligible_attendance_rate")
+    elig_meaningful = _num("eligible_meaningful_attended_events")
+    elig_meaningful_total = _num("eligible_meaningful_events")
+    elig_meaningful_rate = _num("eligible_meaningful_attendance_rate")
+    weighted = _num("weighted_engagement_score")
+    weighted_rate = _num("weighted_engagement_rate")
+    post_elig = _num("post_deadline_attended_eligible_events")
+    post_elig_rate = _num("post_deadline_eligible_attendance_rate")
+    post_weighted_rate = _num("post_deadline_weighted_engagement_rate")
+    post_meaningful = _num("post_deadline_meaningful_touchpoints")
+
+    if int(row.get("community_acquired", 0) or 0) > 0:
+        uplift += 0.03
+    uplift += min(total, 4) * 0.015
+    uplift += min(active_days, 4) * 0.012
+    uplift += min(om, 4) * 0.040
+    uplift += min(comp, 3) * 0.050
+    uplift += min(winner, 2) * 0.100
+    uplift += min(hi, 4) * 0.035
+    uplift += min(hi_div, 3) * 0.025
+    # Eligibility is upgrade-only: high attendance out of eligible journey events
+    # can lift the score, but a low ratio is never used as a penalty.
+    uplift += min(elig, 5) * 0.008
+    uplift += min(elig_meaningful, 4) * 0.028
+    if elig_total >= 4 and elig_rate >= 0.70:
+        uplift += 0.070
+    elif elig_total >= 3 and elig_rate >= 0.50:
+        uplift += 0.040
+    if elig_meaningful_total >= 2 and elig_meaningful_rate >= 0.70:
+        uplift += 0.080
+    elif elig_meaningful_total >= 2 and elig_meaningful_rate >= 0.50:
+        uplift += 0.045
+    if weighted_rate >= 0.70:
+        uplift += 0.070
+    elif weighted_rate >= 0.50:
+        uplift += 0.040
+    uplift += min(weighted / 20.0, 1.0) * 0.080
+    uplift += min(post_elig, 3) * 0.010
+    if post_elig_rate >= 0.60 or post_weighted_rate >= 0.60:
+        uplift += 0.040
+    uplift += min(post_meaningful, 3) * 0.035
+    if int(row.get("reactivated_after_deadline", 0) or 0) > 0:
+        uplift += 0.035
+    if int(row.get("activated_week1", 0) or 0) > 0:
+        uplift += 0.035
+    elif int(row.get("activated_week2", 0) or 0) > 0:
+        uplift += 0.020
+    if int(row.get("early_meaningful_activity", 0) or 0) > 0:
+        uplift += 0.040
+
+    eq = clean_text(row.get("Engagement Quality", ""))
+    if eq == "High Engaged":
+        uplift += 0.160
+    elif eq == "Medium Engaged":
+        uplift += 0.095
+    elif eq == "Low Engaged":
+        uplift += 0.030
+
+    return round(max(0.0, min(0.55, uplift)), 4)
+
+
+def _ml_positive_probability_floor(row: pd.Series) -> float:
+    """Minimum probability floor from positive engagement-quality rules only.
+
+    Floors prevent obviously engaged/high-impact unpaid students from appearing as
+    0–2% simply because a small/split historical model is conservative. They are
+    monotonic positive rules: no signal ever decreases probability.
+    """
+    def _int(name):
+        try:
+            return int(float(row.get(name, 0) or 0))
+        except Exception:
+            return 0
+
+    eq = clean_text(row.get("Engagement Quality", ""))
+    om = _int("online_masterclass_count")
+    comp = _int("competition_count")
+    winner = _int("winner_spotlight_count")
+    hi = _int("high_impact_group_touchpoints")
+    meaningful = _int("meaningful_touchpoints")
+    post_meaningful = _int("post_deadline_meaningful_touchpoints")
+    total = _int("total_touchpoints")
+    eligible = _int("eligible_events")
+    eligible_attended = _int("eligible_attended_events")
+    eligible_meaningful = _int("eligible_meaningful_events")
+    eligible_meaningful_attended = _int("eligible_meaningful_attended_events")
+    try:
+        eligible_rate = float(row.get("eligible_attendance_rate", 0) or 0)
+    except Exception:
+        eligible_rate = 0.0
+    try:
+        eligible_meaningful_rate = float(row.get("eligible_meaningful_attendance_rate", 0) or 0)
+    except Exception:
+        eligible_meaningful_rate = 0.0
+    try:
+        weighted_rate = float(row.get("weighted_engagement_rate", 0) or 0)
+    except Exception:
+        weighted_rate = 0.0
+
+    floor = 0.0
+    if winner > 0:
+        floor = max(floor, 0.68)
+    if eq == "High Engaged" and (om + comp + winner + hi) > 0:
+        floor = max(floor, 0.66)
+    elif eq == "High Engaged":
+        floor = max(floor, 0.52)
+    if eq == "Medium Engaged":
+        floor = max(floor, 0.46)
+    if eq == "Low Engaged" and total > 0:
+        floor = max(floor, 0.24)
+    if hi >= 3:
+        floor = max(floor, 0.60)
+    elif hi >= 2:
+        floor = max(floor, 0.52)
+    elif hi >= 1:
+        floor = max(floor, 0.36)
+    if comp >= 2 or om >= 3:
+        floor = max(floor, 0.50)
+    elif comp >= 1 or om >= 1:
+        floor = max(floor, 0.30)
+    if meaningful >= 3:
+        floor = max(floor, 0.48)
+    # Eligibility is upgrade-only. Strong attendance out of eligible events
+    # creates a positive floor; weak attendance creates no floor and no penalty.
+    if eligible >= 7 and eligible_attended >= 6 and eligible_rate >= 0.70:
+        floor = max(floor, 0.62)
+    elif eligible >= 4 and eligible_rate >= 0.75:
+        floor = max(floor, 0.56)
+    elif eligible >= 3 and eligible_rate >= 0.50:
+        floor = max(floor, 0.42)
+    if eligible_meaningful >= 3 and eligible_meaningful_attended >= 2 and eligible_meaningful_rate >= 0.60:
+        floor = max(floor, 0.58)
+    elif eligible_meaningful >= 2 and eligible_meaningful_rate >= 0.50:
+        floor = max(floor, 0.46)
+    if weighted_rate >= 0.75:
+        floor = max(floor, 0.58)
+    elif weighted_rate >= 0.55:
+        floor = max(floor, 0.48)
+    if post_meaningful >= 2:
+        floor = max(floor, 0.44)
+    elif post_meaningful >= 1:
+        floor = max(floor, 0.34)
+    if int(row.get("community_acquired", 0) or 0) > 0 and meaningful >= 1:
+        floor = max(floor, 0.36)
+    return round(max(0.0, min(0.85, floor)), 4)
+
+
+def _ml_apply_positive_probability_adjustment(base_prob, row: pd.Series):
+    try:
+        base = float(base_prob)
+    except Exception:
+        base = 0.0
+    base = max(0.0, min(1.0, base))
+    uplift = _ml_positive_engagement_uplift(row)
+    floor = _ml_positive_probability_floor(row)
+    adjusted = base + (uplift * (1.0 - base))
+    adjusted = max(adjusted, floor)
+    adjusted = max(base, adjusted)  # positive-only; never reduce base ML score
+    return round(max(0.0, min(0.97, adjusted)), 6), uplift, floor
+
 def score_ml_students(model, feature_df: pd.DataFrame, threshold_mode: str = "Balanced") -> pd.DataFrame:
     if model is None or feature_df is None or feature_df.empty:
         return pd.DataFrame()
@@ -10373,9 +10559,17 @@ def score_ml_students(model, feature_df: pd.DataFrame, threshold_mode: str = "Ba
         X[c] = X[c].astype(str).fillna("Unknown")
     out = feature_df.copy()
     try:
-        out["Payment Probability"] = model.predict_proba(X)[:, 1]
+        base_probability = model.predict_proba(X)[:, 1]
     except Exception:
-        out["Payment Probability"] = model.predict(X)
+        base_probability = model.predict(X)
+    out["Base ML Probability"] = pd.to_numeric(pd.Series(base_probability, index=out.index), errors="coerce").fillna(0).clip(0, 1)
+    adjusted_rows = out.apply(lambda r: _ml_apply_positive_probability_adjustment(r.get("Base ML Probability", 0), r), axis=1)
+    out["Payment Probability"] = [float(x[0]) for x in adjusted_rows]
+    out["Positive Engagement Uplift"] = [float(x[1]) for x in adjusted_rows]
+    out["Positive Signal Floor"] = [float(x[2]) for x in adjusted_rows]
+    out["Base ML Probability %"] = (out["Base ML Probability"].astype(float) * 100).round(1)
+    out["Positive Engagement Uplift %"] = (out["Positive Engagement Uplift"].astype(float) * 100).round(1)
+    out["Positive Signal Floor %"] = (out["Positive Signal Floor"].astype(float) * 100).round(1)
     out["Payment Probability %"] = (out["Payment Probability"].astype(float) * 100).round(1)
     base_threshold = float(getattr(model, "ml_base_threshold_", getattr(model, "ml_threshold_", 0.50)))
     threshold = _ml_threshold_for_mode(base_threshold, threshold_mode)
@@ -10399,8 +10593,8 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
     st.subheader(page_title)
     st.caption(
         "Predicts payment/conversion probability from payment-safe behavior. "
-        "Main prediction uses offered-to-deadline behavior plus payment-safe post-deadline reactivation signals. Converted students are capped before payment; unpaid students use currently observed late activity only as a separate late-intent signal. "
-        "Refunded students are included as converted because they paid once."
+        "The base ML model uses safe factual activity counts; Engagement Quality, high-impact repeated events, Winner/Spotlight, and eligible-event attendance are added only as positive upgrade signals so they never reduce or downgrade a student's score. "
+        "Converted students are capped before payment; refunded students are included as converted because they paid once."
     )
     if target_program:
         st.info(f"This page trains and scores using only {target_program} student data. UG and PG models are separated so each program learns from its own conversion behaviour.")
@@ -10525,7 +10719,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                 show_df = show_df[show_df["Prediction Band"].astype(str).isin(band_filter)]
             cols = [c for c in [
                 "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Counsellor", "Community Acquired",
-                "Payment Probability %", "Prediction Band", "Predicted Conversion", "Model Threshold",
+                "Payment Probability %", "Base ML Probability %", "Positive Engagement Uplift %", "Positive Signal Floor %", "Prediction Band", "Predicted Conversion", "Model Threshold",
                 "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days",
                 "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
                 "Engagement Quality", "engagement_quality_score", "weighted_engagement_score", "eligible_events", "eligible_attended_events", "eligible_attendance_rate", "eligible_attendance_signal",
@@ -10599,7 +10793,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                     st.dataframe(summary.sort_values("Avg_Probability", ascending=False), use_container_width=True, hide_index=True, key=_ml_key("ml_reactivation_summary"))
                 cols = [c for c in [
                     "Name", "Email", "Program", "Batch", "Course", "Country", "Community Acquired",
-                    "Payment Probability %", "Prediction Band", "Predicted Conversion",
+                    "Payment Probability %", "Base ML Probability %", "Positive Engagement Uplift %", "Positive Signal Floor %", "Prediction Band", "Predicted Conversion",
                     "post_deadline_touchpoints", "post_deadline_meaningful_touchpoints", "post_deadline_online_masterclass_count",
                     "post_deadline_competition_count", "post_deadline_general_fun_count", "reactivation_gap_days",
                     "post_deadline_eligible_events", "post_deadline_attended_eligible_events", "post_deadline_eligible_attendance_rate", "post_deadline_weighted_engagement_rate",
@@ -10637,7 +10831,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                 show_df = show_df[keep]
             cols = [c for c in [
                 "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Community Acquired",
-                "Payment Probability %", "Prediction Band", "Predicted Conversion", "Threshold Mode", "Model Threshold", "Actual Paid",
+                "Payment Probability %", "Base ML Probability %", "Positive Engagement Uplift %", "Positive Signal Floor %", "Prediction Band", "Predicted Conversion", "Threshold Mode", "Model Threshold", "Actual Paid",
                 "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days",
                 "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
                 "Engagement Quality", "engagement_quality_score", "weighted_engagement_score", "eligible_events", "eligible_attended_events", "eligible_attendance_rate", "eligible_attendance_signal",
