@@ -9008,11 +9008,11 @@ def _ml_probability_band(prob: float) -> str:
         p = 0.0
     # Business-facing bands are intentionally stricter than the raw model
     # threshold so the dashboard does not over-label unpaid students as high intent.
-    if p >= 0.85:
+    if p >= 0.88:
         return "Very High Intent"
-    if p >= 0.70:
+    if p >= 0.76:
         return "High Intent"
-    if p >= 0.45:
+    if p >= 0.50:
         return "Medium Intent"
     if p >= 0.25:
         return "Low Intent"
@@ -9025,10 +9025,15 @@ def _ml_student_reason(row: pd.Series) -> str:
     prob = row.get("Payment Probability", None)
     base_prob = row.get("Base ML Probability", None)
     uplift = row.get("Positive Engagement Uplift", None)
+    hist_prob = row.get("Historical Pattern Probability", None)
+    hist_n = row.get("Historical Segment Size", None)
     try:
         if prob is not None and not pd.isna(prob):
             if base_prob is not None and not pd.isna(base_prob):
-                reasons.append(f"final probability {float(prob) * 100:.1f}% (base ML {float(base_prob) * 100:.1f}% + positive engagement signals)")
+                if hist_prob is not None and not pd.isna(hist_prob):
+                    reasons.append(f"final probability {float(prob) * 100:.1f}% (base ML {float(base_prob) * 100:.1f}%, similar-student historical rate {float(hist_prob) * 100:.1f}% from n={int(hist_n or 0)}, then conservative positive signals)")
+                else:
+                    reasons.append(f"final probability {float(prob) * 100:.1f}% (base ML {float(base_prob) * 100:.1f}% + positive engagement signals)")
             else:
                 reasons.append(f"model probability {float(prob) * 100:.1f}%")
         if uplift is not None and not pd.isna(uplift) and float(uplift) > 0:
@@ -10123,10 +10128,10 @@ def _ml_threshold_for_mode(base_threshold: float, mode: str) -> float:
     # but live "Likely to Pay" should not become too broad when a split picks a
     # low F1 threshold.
     if "recall" in mode:
-        return max(0.45, min(0.95, base - 0.10))
+        return max(0.60, min(0.95, base - 0.06))
     if "precision" in mode:
-        return max(0.72, min(0.95, base + 0.12))
-    return max(0.60, min(0.95, base))
+        return max(0.78, min(0.95, base + 0.12))
+    return max(0.70, min(0.95, base))
 
 
 def _ml_prediction_label(prob: float, threshold: float) -> str:
@@ -10134,6 +10139,38 @@ def _ml_prediction_label(prob: float, threshold: float) -> str:
         return "Likely to Pay" if float(prob) >= float(threshold) else "Needs Nurture"
     except Exception:
         return "Needs Nurture"
+
+
+def _ml_prediction_label_gated(row: pd.Series, threshold: float) -> str:
+    try:
+        p = float(row.get("Payment Probability", 0) or 0)
+    except Exception:
+        p = 0.0
+    if p < float(threshold):
+        return "Needs Nurture"
+    # A very high probability can pass on model+history alone; otherwise require
+    # genuine high-intent evidence so broad average probability does not create
+    # too many likely-to-pay rows.
+    if p >= 0.82 or _ml_has_genuine_high_intent_evidence(row):
+        return "Likely to Pay"
+    return "Needs Nurture"
+
+
+def _ml_probability_band_gated(row: pd.Series) -> str:
+    try:
+        p = float(row.get("Payment Probability", 0) or 0)
+    except Exception:
+        p = 0.0
+    genuine = _ml_has_genuine_high_intent_evidence(row)
+    if p >= 0.88 and genuine:
+        return "Very High Intent"
+    if p >= 0.76 and genuine:
+        return "High Intent"
+    if p >= 0.50:
+        return "Medium Intent"
+    if p >= 0.25:
+        return "Low Intent"
+    return "Cold"
 
 
 def train_ml_payment_models(train_df: pd.DataFrame, preferred_model: str = "Gradient Boosting", progress_callback=None, progress_start: int = 62, progress_end: int = 88):
@@ -10290,12 +10327,16 @@ def train_ml_payment_models(train_df: pd.DataFrame, preferred_model: str = "Grad
         best_pipe.fit(X, y, model__sample_weight=all_weight)
     else:
         best_pipe.fit(X, y)
+
+    historical_reference = _ml_build_historical_conversion_reference(train_df)
     try:
         base_thr = float(thresholds.get(best_name, 0.50))
         best_pipe.ml_threshold_ = base_thr
         best_pipe.ml_base_threshold_ = base_thr
         best_pipe.ml_model_name_ = str(best_name)
         best_pipe.ml_fallback_best_name_ = str(fallback_best)
+        best_pipe.ml_historical_conversion_reference_ = historical_reference
+        best_pipe.ml_global_conversion_rate_ = float(historical_reference.get("global_rate", 0.0) or 0.0)
     except Exception:
         pass
     _ml_progress(progress_callback, progress_end - 1, "Calculating model feature importance and error audit...")
@@ -10377,6 +10418,251 @@ def _ml_feature_importance(pipe, numeric_cols, categorical_cols) -> pd.DataFrame
 
 
 
+
+
+def _ml_status_reference_group(status_text: str) -> str:
+    """Compact, non-leaky grouping for current counsellor/status text.
+
+    This is used for historical calibration and light scoring context only. Final
+    paid/refund words are not treated as positive intent because those are labels,
+    not pre-payment behaviour.
+    """
+    s = clean_text(status_text).lower()
+    if not s:
+        return "Neutral / Unknown Status"
+    if "admitted" in s or "refund" in s:
+        return "Final Label Status"
+    high_patterns = [
+        "high intent", "will pay high", "payment in progress", "payment pending",
+        "paying", "confirmed", "hot", "ready to pay", "converted soon",
+    ]
+    medium_patterns = [
+        "will pay", "interested", "warm", "deadline extended", "extended",
+        "follow up", "follow-up", "asked", "considering", "maybe", "positive",
+    ]
+    low_patterns = ["will pay low", "low", "cold", "not interested", "not responding", "unresponsive", "lost", "dropped", "drop"]
+    if any(x in s for x in high_patterns):
+        return "Positive Status"
+    if any(x in s for x in low_patterns):
+        return "Low / Cold Status"
+    if any(x in s for x in medium_patterns):
+        return "Warm Status"
+    return "Neutral / Unknown Status"
+
+
+def _ml_meaningful_bin_from_row(row: pd.Series) -> str:
+    try:
+        meaningful = int(float(row.get("meaningful_touchpoints", 0) or 0))
+    except Exception:
+        meaningful = 0
+    try:
+        total = int(float(row.get("total_touchpoints", 0) or 0))
+    except Exception:
+        total = 0
+    if total <= 0:
+        return "No activity"
+    if meaningful <= 0:
+        return "General only"
+    if meaningful == 1:
+        return "1 meaningful"
+    if meaningful == 2:
+        return "2 meaningful"
+    return "3+ meaningful"
+
+
+def _ml_high_signal_bin_from_row(row: pd.Series) -> str:
+    try:
+        winner = int(float(row.get("winner_spotlight_count", 0) or 0))
+        hi = int(float(row.get("high_impact_group_touchpoints", 0) or 0))
+        comp = int(float(row.get("competition_count", 0) or 0))
+        om = int(float(row.get("online_masterclass_count", 0) or 0))
+        elig_att = int(float(row.get("eligible_attended_events", 0) or 0))
+        elig_rate = float(row.get("eligible_attendance_rate", 0) or 0)
+    except Exception:
+        winner = hi = comp = om = elig_att = 0
+        elig_rate = 0.0
+    if winner > 0:
+        return "Winner / Spotlight"
+    if hi >= 2 or comp >= 2 or om >= 3:
+        return "Strong high-impact activity"
+    if hi >= 1 or comp >= 1 or om >= 1:
+        return "Some meaningful activity"
+    if elig_att >= 4 and elig_rate >= 0.65:
+        return "Strong eligible attendance"
+    return "No high-impact signal"
+
+
+def _ml_calibration_row_signature(row: pd.Series) -> dict:
+    eq = clean_text(row.get("Engagement Quality", "")) or "Unknown Engagement"
+    comm = "In Community" if int(row.get("community_acquired", 0) or 0) > 0 else "Out Community"
+    status_group = _ml_status_reference_group(row.get("Current Status", ""))
+    meaningful_bin = _ml_meaningful_bin_from_row(row)
+    high_signal = _ml_high_signal_bin_from_row(row)
+    return {
+        "engagement_quality": eq,
+        "community_group": comm,
+        "status_group": status_group,
+        "meaningful_bin": meaningful_bin,
+        "high_signal_bin": high_signal,
+    }
+
+
+def _ml_key_from_parts(parts) -> str:
+    return " || ".join([clean_text(x) for x in parts])
+
+
+def _ml_smoothed_rate(positive: float, total: float, global_rate: float, prior: float = 35.0) -> float:
+    try:
+        positive = float(positive)
+        total = float(total)
+        global_rate = float(global_rate)
+        prior = float(prior)
+        if total <= 0:
+            return global_rate
+        return (positive + (global_rate * prior)) / (total + prior)
+    except Exception:
+        return 0.0
+
+
+def _ml_build_historical_conversion_reference(train_df: pd.DataFrame) -> dict:
+    """Build conversion-rate references from historical rows.
+
+    These references are used to calibrate live unpaid predictions so the final
+    probability is grounded in how similar historical students actually converted,
+    not only arbitrary positive uplift rules.
+    """
+    if train_df is None or train_df.empty or "Actual Paid" not in train_df.columns:
+        return {"global_rate": 0.0, "levels": {}}
+    df = train_df.copy()
+    df["Actual Paid"] = pd.to_numeric(df["Actual Paid"], errors="coerce").fillna(0).astype(int)
+    global_rate = float(df["Actual Paid"].mean()) if len(df) else 0.0
+    sig = df.apply(lambda r: pd.Series(_ml_calibration_row_signature(r)), axis=1)
+    for c in sig.columns:
+        df[c] = sig[c].astype(str)
+
+    # From most specific to broadest. Each level stores smoothed rates and sample size.
+    level_specs = [
+        ("specific", ["engagement_quality", "community_group", "status_group", "meaningful_bin", "high_signal_bin"], 18, 45.0),
+        ("quality_status_signal", ["engagement_quality", "status_group", "high_signal_bin"], 18, 40.0),
+        ("quality_community_meaningful", ["engagement_quality", "community_group", "meaningful_bin"], 22, 40.0),
+        ("quality_signal", ["engagement_quality", "high_signal_bin"], 25, 38.0),
+        ("status_meaningful", ["status_group", "meaningful_bin"], 25, 38.0),
+        ("engagement_quality", ["engagement_quality"], 25, 35.0),
+        ("status_group", ["status_group"], 25, 35.0),
+        ("community_group", ["community_group"], 25, 35.0),
+    ]
+    levels = {}
+    for level_name, cols, min_n, prior in level_specs:
+        level = {}
+        if not set(cols).issubset(df.columns):
+            continue
+        grouped = df.groupby(cols, dropna=False)["Actual Paid"].agg(["sum", "count"]).reset_index()
+        for _, gr in grouped.iterrows():
+            key = _ml_key_from_parts([gr[c] for c in cols])
+            n = int(gr["count"])
+            pos = int(gr["sum"])
+            level[key] = {
+                "rate": float(_ml_smoothed_rate(pos, n, global_rate, prior=prior)),
+                "raw_rate": float(pos / n) if n else global_rate,
+                "n": n,
+                "positive": pos,
+                "min_n": int(min_n),
+                "columns": cols,
+                "label": level_name,
+            }
+        levels[level_name] = level
+    return {"global_rate": global_rate, "rows": int(len(df)), "converted": int(df["Actual Paid"].sum()), "levels": levels}
+
+
+def _ml_historical_reference_probability(row: pd.Series, reference: dict):
+    """Return calibrated historical probability, sample size, and segment label."""
+    if not isinstance(reference, dict) or not reference:
+        return 0.0, 0, "No historical reference"
+    global_rate = float(reference.get("global_rate", 0.0) or 0.0)
+    levels = reference.get("levels", {}) or {}
+    sig = _ml_calibration_row_signature(row)
+    candidates = [
+        ("specific", [sig["engagement_quality"], sig["community_group"], sig["status_group"], sig["meaningful_bin"], sig["high_signal_bin"]]),
+        ("quality_status_signal", [sig["engagement_quality"], sig["status_group"], sig["high_signal_bin"]]),
+        ("quality_community_meaningful", [sig["engagement_quality"], sig["community_group"], sig["meaningful_bin"]]),
+        ("quality_signal", [sig["engagement_quality"], sig["high_signal_bin"]]),
+        ("status_meaningful", [sig["status_group"], sig["meaningful_bin"]]),
+        ("engagement_quality", [sig["engagement_quality"]]),
+        ("status_group", [sig["status_group"]]),
+        ("community_group", [sig["community_group"]]),
+    ]
+    best_low_sample = None
+    for level_name, parts in candidates:
+        level = levels.get(level_name, {})
+        key = _ml_key_from_parts(parts)
+        rec = level.get(key)
+        if not rec:
+            continue
+        n = int(rec.get("n", 0) or 0)
+        min_n = int(rec.get("min_n", 20) or 20)
+        if n >= min_n:
+            return float(rec.get("rate", global_rate)), n, f"{level_name}: {key}"
+        if best_low_sample is None or n > int(best_low_sample.get("n", 0) or 0):
+            best_low_sample = {**rec, "level_name": level_name, "key": key}
+    if best_low_sample is not None and int(best_low_sample.get("n", 0) or 0) >= 8:
+        # Very small segments are blended heavily to global via smoothing, so they
+        # can be used as a weak reference but never as a strong threshold driver.
+        return float(best_low_sample.get("rate", global_rate)), int(best_low_sample.get("n", 0) or 0), f"low-sample {best_low_sample.get('level_name')}: {best_low_sample.get('key')}"
+    return global_rate, int(reference.get("rows", 0) or 0), "global historical conversion rate"
+
+
+def _ml_has_genuine_high_intent_evidence(row: pd.Series) -> bool:
+    """Gate high-intent labels to students with real behavioural/status evidence."""
+    try:
+        meaningful = int(float(row.get("meaningful_touchpoints", 0) or 0))
+        winner = int(float(row.get("winner_spotlight_count", 0) or 0))
+        high_impact = int(float(row.get("high_impact_group_touchpoints", 0) or 0))
+        elig_att = int(float(row.get("eligible_attended_events", 0) or 0))
+        elig_rate = float(row.get("eligible_attendance_rate", 0) or 0)
+        post_meaningful = int(float(row.get("post_deadline_meaningful_touchpoints", 0) or 0))
+    except Exception:
+        meaningful = winner = high_impact = elig_att = post_meaningful = 0
+        elig_rate = 0.0
+    status_group = _ml_status_reference_group(row.get("Current Status", ""))
+    eq = clean_text(row.get("Engagement Quality", ""))
+    return bool(
+        winner > 0
+        or high_impact >= 2
+        or meaningful >= 3
+        or (eq == "High Engaged" and meaningful >= 2)
+        or (elig_att >= 5 and elig_rate >= 0.70)
+        or post_meaningful >= 2
+        or (status_group == "Positive Status" and meaningful >= 1)
+    )
+
+
+def _ml_apply_historical_probability_cap(row: pd.Series, probability: float, historical_rate: float, base_prob: float) -> float:
+    """Prevent broad over-scoring when historical patterns do not support it."""
+    try:
+        p = float(probability)
+        hist = float(historical_rate)
+        base = float(base_prob)
+    except Exception:
+        return float(probability or 0.0)
+    status_group = _ml_status_reference_group(row.get("Current Status", ""))
+    meaningful_bin = _ml_meaningful_bin_from_row(row)
+    high_signal = _ml_high_signal_bin_from_row(row)
+    genuine = _ml_has_genuine_high_intent_evidence(row)
+
+    # No activity/general-only students should not become high intent unless the
+    # model itself and status/history strongly support it.
+    if not genuine:
+        if meaningful_bin == "No activity":
+            p = min(p, max(base, hist + 0.06, 0.32))
+        elif meaningful_bin == "General only":
+            p = min(p, max(base, hist + 0.08, 0.40))
+        else:
+            p = min(p, max(base, hist + 0.12, 0.55))
+    if status_group == "Low / Cold Status" and not genuine:
+        p = min(p, 0.42)
+    elif status_group == "Low / Cold Status" and high_signal == "No high-impact signal":
+        p = min(p, 0.55)
+    return p
 
 def _ml_status_reference_signal(status_text: str) -> float:
     """Light current-status reference used only after scoring, never as a base ML feature.
@@ -10620,19 +10906,52 @@ def _ml_positive_probability_floor(row: pd.Series) -> float:
     return round(max(0.0, min(0.70, floor)), 4)
 
 
-def _ml_apply_positive_probability_adjustment(base_prob, row: pd.Series):
+def _ml_apply_positive_probability_adjustment(base_prob, row: pd.Series, historical_reference: dict = None):
+    """Calibrate model probability with historical conversion patterns.
+
+    Final probability is no longer driven by broad fixed floors. It blends the
+    model's base probability with the conversion rate of similar historical
+    students, then applies only small positive upgrades for genuine signals.
+    """
     try:
         base = float(base_prob)
     except Exception:
         base = 0.0
     base = max(0.0, min(1.0, base))
-    uplift = _ml_positive_engagement_uplift(row)
-    floor = _ml_positive_probability_floor(row)
-    adjusted = base + (uplift * (1.0 - base))
-    adjusted = max(adjusted, floor)
-    adjusted = max(base, adjusted)  # engagement/eligibility upgrades never reduce base ML score
+
+    hist_rate, hist_n, hist_segment = _ml_historical_reference_probability(row, historical_reference or {})
+    hist_rate = max(0.0, min(1.0, float(hist_rate or 0.0)))
+
+    # More historical weight when the reference segment has enough examples.
+    if hist_n >= 80:
+        hist_weight = 0.40
+    elif hist_n >= 35:
+        hist_weight = 0.32
+    elif hist_n >= 15:
+        hist_weight = 0.22
+    else:
+        hist_weight = 0.12
+    calibrated_base = ((1.0 - hist_weight) * base) + (hist_weight * hist_rate)
+
+    raw_uplift = _ml_positive_engagement_uplift(row)
+    # Keep upgrades meaningful but conservative; the model + history remain the
+    # main score. Strong engagement helps, but it cannot flood the pipeline.
+    uplift = min(float(raw_uplift or 0.0), 0.10)
+    adjusted = calibrated_base + (uplift * (1.0 - calibrated_base) * 0.60)
+
+    raw_floor = _ml_positive_probability_floor(row)
+    if raw_floor > 0:
+        # Floors are allowed only when supported by the model/historical rate.
+        evidence_supported_floor = min(float(raw_floor), max(calibrated_base + 0.06, hist_rate + 0.10), 0.62)
+        adjusted = max(adjusted, evidence_supported_floor)
+
+    # Engagement/eligibility can still only upgrade above the base model output,
+    # but broad historical caps prevent weak signals from becoming High Intent.
+    adjusted = max(base, adjusted)
+    adjusted = _ml_apply_historical_probability_cap(row, adjusted, hist_rate, base)
     adjusted = _ml_status_soft_cap(row, adjusted)
-    return round(max(0.0, min(0.92, adjusted)), 6), uplift, floor
+    adjusted = max(0.0, min(0.90, adjusted))
+    return round(adjusted, 6), round(float(uplift), 6), round(float(raw_floor or 0.0), 6), round(hist_rate, 6), int(hist_n or 0), hist_segment, round(calibrated_base, 6)
 
 def score_ml_students(model, feature_df: pd.DataFrame, threshold_mode: str = "Balanced") -> pd.DataFrame:
     if model is None or feature_df is None or feature_df.empty:
@@ -10649,11 +10968,18 @@ def score_ml_students(model, feature_df: pd.DataFrame, threshold_mode: str = "Ba
     except Exception:
         base_probability = model.predict(X)
     out["Base ML Probability"] = pd.to_numeric(pd.Series(base_probability, index=out.index), errors="coerce").fillna(0).clip(0, 1)
-    adjusted_rows = out.apply(lambda r: _ml_apply_positive_probability_adjustment(r.get("Base ML Probability", 0), r), axis=1)
+    historical_reference = getattr(model, "ml_historical_conversion_reference_", {})
+    adjusted_rows = out.apply(lambda r: _ml_apply_positive_probability_adjustment(r.get("Base ML Probability", 0), r, historical_reference), axis=1)
     out["Payment Probability"] = [float(x[0]) for x in adjusted_rows]
     out["Positive Engagement Uplift"] = [float(x[1]) for x in adjusted_rows]
     out["Positive Signal Floor"] = [float(x[2]) for x in adjusted_rows]
+    out["Historical Pattern Probability"] = [float(x[3]) for x in adjusted_rows]
+    out["Historical Segment Size"] = [int(x[4]) for x in adjusted_rows]
+    out["Historical Calibration Segment"] = [clean_text(x[5]) for x in adjusted_rows]
+    out["Calibrated Base Probability"] = [float(x[6]) for x in adjusted_rows]
     out["Base ML Probability %"] = (out["Base ML Probability"].astype(float) * 100).round(1)
+    out["Historical Pattern Probability %"] = (out["Historical Pattern Probability"].astype(float) * 100).round(1)
+    out["Calibrated Base Probability %"] = (out["Calibrated Base Probability"].astype(float) * 100).round(1)
     out["Positive Engagement Uplift %"] = (out["Positive Engagement Uplift"].astype(float) * 100).round(1)
     out["Positive Signal Floor %"] = (out["Positive Signal Floor"].astype(float) * 100).round(1)
     out["Payment Probability %"] = (out["Payment Probability"].astype(float) * 100).round(1)
@@ -10661,8 +10987,8 @@ def score_ml_students(model, feature_df: pd.DataFrame, threshold_mode: str = "Ba
     threshold = _ml_threshold_for_mode(base_threshold, threshold_mode)
     out["Model Threshold"] = round(threshold, 3)
     out["Threshold Mode"] = threshold_mode
-    out["Predicted Conversion"] = out["Payment Probability"].map(lambda p: _ml_prediction_label(p, threshold))
-    out["Prediction Band"] = out["Payment Probability"].map(_ml_probability_band)
+    out["Predicted Conversion"] = out.apply(lambda r: _ml_prediction_label_gated(r, threshold), axis=1)
+    out["Prediction Band"] = out.apply(_ml_probability_band_gated, axis=1)
     out["Why This Probability"] = out.apply(_ml_student_reason, axis=1)
     out["Recommended Conversion Actions"] = out.apply(_ml_recommended_actions, axis=1)
     out["Top Factors"] = out["Why This Probability"]
@@ -10753,6 +11079,20 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         "The selected model is evaluated with train/test split, then refit on all historical labelled rows before scoring current unpaid students."
     )
 
+    with st.expander("How this ML prediction score is calculated", expanded=False):
+        st.markdown(
+            """
+            **Prediction logic used here**
+
+            1. **Train/test model:** Logistic Regression, Random Forest, Extra Trees, and Gradient Boosting are evaluated on a held-out test split. Gradient Boosting is used for scoring when it trains successfully.
+            2. **Safe observation window:** Converted students use only activity before payment. Unpaid students use the offer-to-deadline journey, plus payment-safe late/reactivation signals where available. No post-payment behaviour is used.
+            3. **Historical calibration:** The base ML probability is blended with the historical conversion rate of similar students, using segments such as Engagement Quality, community status, current status group, meaningful activity level, and high-impact signal.
+            4. **Positive-only signals:** Engagement Quality, Winner/Spotlight, high-impact repeated event groups, and strong eligible attendance can only upgrade the score. Weak eligibility or missed eligible events never downgrade a student.
+            5. **Genuine high-intent gate:** High Intent is now stricter. A student needs both a high calibrated probability and real evidence such as meaningful activities, high-impact event groups, strong eligible attendance, Winner/Spotlight, or a positive counsellor/status signal.
+            6. **Current status:** Status is used only as a light reference. Positive statuses can slightly support the score, while low/cold statuses prevent weakly engaged students from being over-marked as High Intent.
+            """
+        )
+
     if not pred_source.empty:
         c1, c2 = st.columns([1, 1])
         with c1:
@@ -10805,7 +11145,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                 show_df = show_df[show_df["Prediction Band"].astype(str).isin(band_filter)]
             cols = [c for c in [
                 "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Counsellor", "Community Acquired", "Current Status", "Status Reference Signal",
-                "Payment Probability %", "Base ML Probability %", "Positive Engagement Uplift %", "Positive Signal Floor %", "Prediction Band", "Predicted Conversion", "Model Threshold",
+                "Payment Probability %", "Base ML Probability %", "Historical Pattern Probability %", "Historical Segment Size", "Calibrated Base Probability %", "Positive Engagement Uplift %", "Positive Signal Floor %", "Prediction Band", "Predicted Conversion", "Model Threshold",
                 "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days",
                 "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
                 "Engagement Quality", "engagement_quality_score", "weighted_engagement_score", "eligible_events", "eligible_attended_events", "eligible_attendance_rate", "eligible_attendance_signal",
@@ -10820,9 +11160,9 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
             if not seg.empty:
                 seg["Priority Segment"] = np.select(
                     [
-                        seg["Payment Probability"].astype(float).ge(0.85),
-                        seg["Payment Probability"].astype(float).ge(0.70),
-                        seg["Payment Probability"].astype(float).ge(0.45),
+                        seg["Payment Probability"].astype(float).ge(0.88),
+                        seg["Payment Probability"].astype(float).ge(0.76),
+                        seg["Payment Probability"].astype(float).ge(0.50),
                     ],
                     ["Immediate payment follow-up", "High-intent nurture", "Medium-intent activation"],
                     default="Low-intent nurture",
@@ -10879,7 +11219,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                     st.dataframe(summary.sort_values("Avg_Probability", ascending=False), use_container_width=True, hide_index=True, key=_ml_key("ml_reactivation_summary"))
                 cols = [c for c in [
                     "Name", "Email", "Program", "Batch", "Course", "Country", "Community Acquired",
-                    "Payment Probability %", "Base ML Probability %", "Positive Engagement Uplift %", "Positive Signal Floor %", "Prediction Band", "Predicted Conversion",
+                    "Payment Probability %", "Base ML Probability %", "Historical Pattern Probability %", "Historical Segment Size", "Calibrated Base Probability %", "Positive Engagement Uplift %", "Positive Signal Floor %", "Prediction Band", "Predicted Conversion",
                     "post_deadline_touchpoints", "post_deadline_meaningful_touchpoints", "post_deadline_online_masterclass_count",
                     "post_deadline_competition_count", "post_deadline_general_fun_count", "reactivation_gap_days",
                     "post_deadline_eligible_events", "post_deadline_attended_eligible_events", "post_deadline_eligible_attendance_rate", "post_deadline_weighted_engagement_rate",
@@ -10917,7 +11257,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                 show_df = show_df[keep]
             cols = [c for c in [
                 "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Community Acquired",
-                "Payment Probability %", "Base ML Probability %", "Positive Engagement Uplift %", "Positive Signal Floor %", "Prediction Band", "Predicted Conversion", "Threshold Mode", "Model Threshold", "Actual Paid",
+                "Payment Probability %", "Base ML Probability %", "Historical Pattern Probability %", "Historical Segment Size", "Calibrated Base Probability %", "Positive Engagement Uplift %", "Positive Signal Floor %", "Prediction Band", "Predicted Conversion", "Threshold Mode", "Model Threshold", "Actual Paid",
                 "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days",
                 "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
                 "Engagement Quality", "engagement_quality_score", "weighted_engagement_score", "eligible_events", "eligible_attended_events", "eligible_attendance_rate", "eligible_attendance_signal",
