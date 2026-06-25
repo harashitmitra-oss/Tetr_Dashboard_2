@@ -9631,7 +9631,7 @@ def _ml_filter_participation_sequence_events(sequence_index: dict, keys, offered
         return df
     df["attended"] = pd.to_numeric(df.get("attended", 0), errors="coerce").fillna(0).astype(int)
     # One planned event per event identity in the student's journey.
-    df = df.sort_values(["event_date", "event_identity_key"]).drop_duplicates(subset=["event_identity_key"], keep="max").copy()
+    df = df.sort_values(["event_date", "event_identity_key"]).drop_duplicates(subset=["event_identity_key"], keep="last").copy()
     return df
 
 
