@@ -10316,14 +10316,14 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None, program_filt
         feature_df = feature_df.drop(columns=eligibility_cols, errors="ignore")
     event_rows_df = pd.DataFrame(event_rows)
     if feature_df.empty:
-        return feature_df, pd.DataFrame(), pd.DataFrame(), event_rows_df
+        return feature_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), event_rows_df
 
     train_df = feature_df[feature_df["training_included"].eq(1)].copy()
     _ml_progress(progress_callback, 58, "Calculating event-level 7/10-day payment conversion intelligence...")
     event_intel_df = build_ml_event_conversion_intelligence(train_df, event_rows_df)
     _ml_progress(progress_callback, 60, "Calculating repeated event-group 7/10-day payment intelligence...")
     group_intel_df = build_ml_group_conversion_intelligence(train_df, event_rows_df)
-    return feature_df, train_df, event_intel_df, group_intel_df
+    return feature_df, train_df, event_intel_df, group_intel_df, event_rows_df
 
 
 def build_ml_event_conversion_intelligence(train_df: pd.DataFrame, event_rows_df: pd.DataFrame) -> pd.DataFrame:
@@ -11422,6 +11422,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
     train_df = pd.DataFrame()
     event_intel_df = pd.DataFrame()
     group_intel_df = pd.DataFrame()
+    event_rows_df = pd.DataFrame()
     model = None
     perf_df = pd.DataFrame()
     confusion_df = pd.DataFrame()
@@ -11434,7 +11435,13 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
 
     try:
         _update_ml_progress(1, "Building current feature set and event intelligence...")
-        feature_df, train_df, event_intel_df, group_intel_df = build_ml_prediction_dataset(data, progress_callback=_update_ml_progress, program_filter=target_program)
+        ml_dataset_result = build_ml_prediction_dataset(data, progress_callback=_update_ml_progress, program_filter=target_program)
+        if isinstance(ml_dataset_result, tuple) and len(ml_dataset_result) == 5:
+            feature_df, train_df, event_intel_df, group_intel_df, event_rows_df = ml_dataset_result
+        else:
+            # Backward-safe fallback for older cached/function variants.
+            feature_df, train_df, event_intel_df, group_intel_df = ml_dataset_result
+            event_rows_df = pd.DataFrame()
 
         saved_bundle, saved_msg = _ml_load_model_bundle(target_program)
         session_bundle = st.session_state.get(session_bundle_key)
