@@ -1,5 +1,8 @@
+import base64
 import json
 import re
+import urllib.error
+import urllib.request
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -77,6 +80,111 @@ def _ml_model_bundle_path(program_filter: str = "") -> Path:
     return ML_MODEL_DIR / f"{_ml_model_file_prefix(program_filter)}.joblib"
 
 
+def _ml_get_github_model_config():
+    """Read optional GitHub save settings from Streamlit secrets.
+
+    Supports both:
+    - GITHUB_OWNER = "org", GITHUB_REPO = "repo"
+    - GITHUB_REPO = "org/repo" with or without GITHUB_OWNER
+    """
+    try:
+        token = clean_text(st.secrets.get("GITHUB_TOKEN", "")) if hasattr(st, "secrets") else ""
+        owner = clean_text(st.secrets.get("GITHUB_OWNER", "")) if hasattr(st, "secrets") else ""
+        repo = clean_text(st.secrets.get("GITHUB_REPO", "")) if hasattr(st, "secrets") else ""
+        branch = clean_text(st.secrets.get("GITHUB_BRANCH", "main")) if hasattr(st, "secrets") else "main"
+    except Exception:
+        return None
+
+    # Accept either repo only (Tetr_Dashboard2) or full slug (owner/Tetr_Dashboard2).
+    if "/" in repo:
+        parts = [x.strip() for x in repo.split("/") if x.strip()]
+        if len(parts) >= 2:
+            owner = owner or parts[-2]
+            repo = parts[-1]
+    if not token or not owner or not repo:
+        return None
+    return {"token": token, "owner": owner, "repo": repo, "branch": branch or "main"}
+
+
+def _ml_push_file_to_github(local_path: Path, repo_path: str) -> tuple[bool, str]:
+    """Create/update a saved model file in GitHub via the Contents API.
+
+    This only runs when GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO, and
+    GITHUB_BRANCH are present in st.secrets. The token needs Contents: Read/Write
+    permission for the repo.
+    """
+    cfg = _ml_get_github_model_config()
+    if not cfg:
+        return False, "GitHub secrets are not fully configured, so model was saved locally only."
+    if not local_path.exists():
+        return False, f"Local model file not found: {local_path}"
+
+    owner, repo, branch, token = cfg["owner"], cfg["repo"], cfg["branch"], cfg["token"]
+    repo_path = str(repo_path).replace("\\", "/").lstrip("/")
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{repo_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "tetr-ml-prediction-dashboard",
+    }
+
+    sha = None
+    try:
+        get_req = urllib.request.Request(f"{api_url}?ref={branch}", headers=headers, method="GET")
+        with urllib.request.urlopen(get_req, timeout=30) as resp:
+            existing = json.loads(resp.read().decode("utf-8"))
+            sha = existing.get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            return False, f"GitHub lookup failed ({e.code}). Check repo/branch/token permissions."
+    except Exception as e:
+        return False, f"GitHub lookup failed: {e}"
+
+    content_b64 = base64.b64encode(local_path.read_bytes()).decode("utf-8")
+    payload = {
+        "message": f"Update saved ML model {repo_path}",
+        "content": content_b64,
+        "branch": branch,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    try:
+        put_req = urllib.request.Request(
+            api_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={**headers, "Content-Type": "application/json"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(put_req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        html_url = result.get("content", {}).get("html_url", "")
+        return True, f"Saved model to GitHub: {repo_path}" + (f" ({html_url})" if html_url else "")
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8")[:500]
+        except Exception:
+            detail = ""
+        return False, f"GitHub save failed ({e.code}). Check token Contents: Read/Write, repo name, branch, and file size. {detail}"
+    except Exception as e:
+        return False, f"GitHub save failed: {e}"
+
+
+def _ml_safe_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a dataframe safe for st.dataframe/Arrow rendering.
+
+    PyArrow fails when duplicate column names are present. Several audit views merge
+    engineered columns from multiple phases, so this defensively de-duplicates columns
+    before rendering without altering the source dataframe.
+    """
+    if df is None or not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    out = df.copy()
+    out = out.loc[:, ~pd.Index(out.columns).duplicated()].copy()
+    return out
+
+
 def _ml_save_model_bundle(program_filter: str, bundle: dict) -> tuple[bool, str]:
     try:
         if not bundle or bundle.get("model") is None:
@@ -87,7 +195,15 @@ def _ml_save_model_bundle(program_filter: str, bundle: dict) -> tuple[bool, str]
         payload["program_filter"] = clean_text(program_filter).upper() if program_filter else "ALL"
         path = _ml_model_bundle_path(program_filter)
         joblib.dump(payload, path)
-        return True, f"Saved trained model bundle to {path}"
+        repo_root = Path(__file__).resolve().parent
+        try:
+            repo_path = path.relative_to(repo_root).as_posix()
+        except Exception:
+            repo_path = f"ml_saved_models/{path.name}"
+        gh_ok, gh_msg = _ml_push_file_to_github(path, repo_path)
+        if gh_ok:
+            return True, f"Saved trained model bundle locally to {path} and pushed to GitHub. {gh_msg}"
+        return True, f"Saved trained model bundle locally to {path}. {gh_msg}"
     except Exception as e:
         return False, f"Could not save trained model: {e}"
 
@@ -11415,7 +11531,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
     with c_status:
         st.caption(
             "By default this page loads the last saved model bundle from `ml_saved_models/`. "
-            "Training runs only when you click the train button. Save writes a reusable `.joblib` bundle inside the app repo path."
+            "Training runs only when you click the train button. Save writes a reusable `.joblib` bundle inside the app repo path and pushes it to GitHub when GitHub secrets are configured."
         )
 
     feature_df = pd.DataFrame()
@@ -11919,7 +12035,10 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
             "batch_journey_events", "batch_journey_attended_events", "batch_journey_meaningful_attended", "batch_journey_high_impact_attended", "longest_consecutive_participation", "max_7_event_window_participation", "one_miss_7_event_pattern", "six_plus_consecutive_participation", "four_plus_meaningful_participation", "compact_activity_gap_pattern", "regular_participation_signal", "participation_pattern_label", "avg_activity_gap_days", "median_activity_gap_days", "post_deadline_longest_consecutive_participation", "post_deadline_one_miss_7_event_pattern", "post_deadline_compact_activity_gap_pattern", "post_deadline_regular_participation_signal", "high_impact_group_touchpoints", "high_impact_group_diversity", "has_high_impact_group", "high_impact_group_intensity",
             "group_count_welcome_webinar", "group_count_life_at_tetr", "group_count_garima_learning", "group_count_pratham_founder", "group_count_tarun_cofounder", "group_count_amitoj_opportunities", "group_count_shahrose_visa", "group_count_career_linkedin", "group_count_netflix_ceo", "group_count_startup_hackathon", "group_count_tetr_club", "group_count_ai_voice_hackathon"
         ] if c in feature_df.columns]
-        st.dataframe(feature_df[audit_cols], use_container_width=True, height=560, hide_index=True, key=_ml_key("ml_training_audit_table"))
+        audit_cols = list(dict.fromkeys(audit_cols))
+        audit_source_df = _ml_safe_display_df(feature_df)
+        audit_cols = [c for c in audit_cols if c in audit_source_df.columns]
+        st.dataframe(_ml_safe_display_df(audit_source_df[audit_cols]), use_container_width=True, height=560, hide_index=True, key=_ml_key("ml_training_audit_table"))
 
 
 def main():
