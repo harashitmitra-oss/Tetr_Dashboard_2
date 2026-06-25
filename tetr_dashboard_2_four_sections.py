@@ -1,5 +1,6 @@
 import base64
 import json
+import hmac
 import re
 import urllib.error
 import urllib.request
@@ -586,6 +587,64 @@ def clean_text(x):
         return ""
     return str(x).replace("\n", " ").replace("\r", " ").replace("\xa0", " ").strip()
 
+
+
+
+def _get_ml_admin_password_secret():
+    """Return configured admin password for ML write actions.
+
+    Supported Streamlit secrets keys, in priority order:
+    - ML_ADMIN_PASSWORD
+    - ADMIN_PASSWORD
+    - DASHBOARD_ADMIN_PASSWORD
+
+    The password is never displayed and is used only to unlock Train, Predict,
+    Save Model, and Save Predictions buttons.
+    """
+    try:
+        secrets_obj = st.secrets if hasattr(st, "secrets") else {}
+        for key in ["ML_ADMIN_PASSWORD", "ADMIN_PASSWORD", "DASHBOARD_ADMIN_PASSWORD"]:
+            try:
+                value = secrets_obj.get(key, "")
+            except Exception:
+                value = ""
+            value = clean_text(value)
+            if value:
+                return value, key
+    except Exception:
+        pass
+    return "", ""
+
+
+def _ml_admin_authorization_block(key_prefix: str):
+    """Render admin password box and return True only when unlocked.
+
+    This protects only ML action buttons. Read-only dashboard views remain visible
+    for everyone, but training, live prediction, and GitHub/local saving need the
+    configured admin password.
+    """
+    admin_password, secret_name = _get_ml_admin_password_secret()
+    with st.expander("🔐 Admin authorization for ML actions", expanded=False):
+        if not admin_password:
+            st.warning(
+                "Admin password secret is not configured, so Train, Predict, and Save buttons are locked. "
+                "Add `ML_ADMIN_PASSWORD` in Streamlit Secrets to enable these actions."
+            )
+            return False
+        entered = st.text_input(
+            "Enter admin password to unlock Train / Predict / Save actions",
+            type="password",
+            key=f"{key_prefix}_ml_admin_password",
+            help=f"Validated against Streamlit secret `{secret_name}`.",
+        )
+        unlocked = bool(entered) and hmac.compare_digest(str(entered), str(admin_password))
+        if unlocked:
+            st.success("Admin actions unlocked for this session/page.")
+        elif entered:
+            st.error("Incorrect admin password. ML action buttons remain locked.")
+        else:
+            st.info("ML action buttons are locked until the admin password is entered.")
+        return unlocked
 
 def normalize_name(x):
     s = clean_text(x).lower()
@@ -12251,6 +12310,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         progress_status.markdown(f"**{pct}%** · {clean_text(message)}")
 
     st.markdown("#### Model training controls")
+    admin_unlocked = _ml_admin_authorization_block(key_prefix)
     session_bundle_key = _ml_key("active_model_bundle")
     prediction_bundle_key = _ml_key("active_prediction_bundle")
 
@@ -12270,13 +12330,13 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
 
     c_train, c_predict, c_save_model, c_save_pred, c_status = st.columns([1.05, 0.9, 1.2, 1.1, 3.25])
     with c_train:
-        train_clicked = st.button("Train / Re-train Model Now", type="primary", key=_ml_key("train_model_now"))
+        train_clicked = st.button("Train / Re-train Model Now", type="primary", key=_ml_key("train_model_now"), disabled=not admin_unlocked)
     with c_predict:
-        predict_clicked = st.button("Predict", key=_ml_key("predict_now"))
+        predict_clicked = st.button("Predict", key=_ml_key("predict_now"), disabled=not admin_unlocked)
     with c_save_model:
-        save_clicked = st.button("Save Current Trained Model", key=_ml_key("save_model_now"))
+        save_clicked = st.button("Save Current Trained Model", key=_ml_key("save_model_now"), disabled=not admin_unlocked)
     with c_save_pred:
-        save_predictions_clicked = st.button("Save Predictions", key=_ml_key("save_predictions_now"))
+        save_predictions_clicked = st.button("Save Predictions", key=_ml_key("save_predictions_now"), disabled=not admin_unlocked)
     with c_status:
         st.caption(
             "By default this page displays the last saved prediction bundle from `ml_saved_predictions/`. "
@@ -12285,6 +12345,8 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
             "Model Save and Prediction Save do not retrain."
         )
         st.caption(_ml_github_config_label())
+        if not admin_unlocked:
+            st.caption("🔒 Train, Predict, Save Model, and Save Predictions are locked. Enter the admin password above to enable them.")
         if has_existing_predictions:
             st.caption("Saved predictions: " + _ml_prediction_bundle_summary(existing_prediction_session if isinstance(existing_prediction_session, dict) else existing_prediction_bundle))
         elif existing_prediction_msg:
