@@ -11968,6 +11968,259 @@ def score_ml_students(model, feature_df: pd.DataFrame, threshold_mode: str = "Ba
     return out.sort_values("Payment Probability", ascending=False).reset_index(drop=True)
 
 
+
+def _ml_week_touchpoint_band(x) -> str:
+    try:
+        n = int(float(x or 0))
+    except Exception:
+        n = 0
+    if n <= 0:
+        return "0"
+    if n == 1:
+        return "1"
+    if n <= 3:
+        return "2-3"
+    if n <= 5:
+        return "4-5"
+    return "6+"
+
+
+def _ml_current_journey_week(offered_dt, today_dt=None) -> int:
+    today_dt = pd.to_datetime(today_dt if today_dt is not None else get_today_ist(), errors="coerce")
+    offered_dt = pd.to_datetime(offered_dt, errors="coerce")
+    if pd.isna(today_dt) or pd.isna(offered_dt):
+        return 0
+    day_num = int((today_dt.normalize() - offered_dt.normalize()).days) + 1
+    if day_num <= 0:
+        return 0
+    return int(max(1, min(4, np.ceil(day_num / 7.0))))
+
+
+def _ml_weekly_prediction_band(prob: float) -> str:
+    try:
+        p = float(prob or 0)
+    except Exception:
+        p = 0.0
+    if p >= 0.70:
+        return "High Current-Window Intent"
+    if p >= 0.50:
+        return "Medium Current-Window Intent"
+    if p >= 0.30:
+        return "Low Current-Window Intent"
+    return "Needs More Activation"
+
+
+def _ml_weekly_recommended_action(row: pd.Series) -> str:
+    week = int(row.get("Current Week", 0) or 0)
+    prob = float(row.get("Current-Window Probability", 0) or 0)
+    cum = int(row.get("Touchpoints Till Current Week", 0) or 0)
+    gap = int(row.get("Days Left To Deadline", 999) if pd.notna(row.get("Days Left To Deadline", np.nan)) else 999)
+    if prob >= 0.70:
+        return "High current-window intent: counsellor should push payment conversation now and reference the activities they have already joined."
+    if cum >= 3 and gap <= 10:
+        return "Strong activity inside deadline window: follow up within 24 hours and connect activity interest to payment deadline."
+    if week <= 2 and cum >= 1:
+        return "Early activation detected: invite to the next meaningful online/masterclass/competition touchpoint and start soft payment nudge."
+    if week >= 3 and cum <= 1:
+        return "Inside late journey with low activity: urgent activation needed through a high-impact event or direct counsellor call."
+    return "Keep nurturing: recommend a meaningful event/masterclass/competition touchpoint before deadline."
+
+
+def build_ml_in_window_weekly_predictions(feature_df: pd.DataFrame, threshold_mode: str = "Balanced") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Predict currently-active unpaid students inside offered-date-to-deadline window.
+
+    This is a separate current-journey intelligence layer. For week 1/2/3/4 it
+    trains a lightweight behaviour-only model using historical rows observed only
+    up to that week after offered date, then scores unpaid active students whose
+    current day falls inside the same week. This compares current students with
+    paid students at the same journey age, without using future/post-payment data.
+    """
+    columns = [
+        "Name", "Email", "Program", "Batch", "Course", "Community Acquired", "Current Status",
+        "Current Week", "Days Since Offer", "Days Left To Deadline", "Touchpoints Till Current Week",
+        "Week 1", "Week 2", "Week 3", "Week 4", "Historical Segment Conversion %",
+        "Historical Segment Size", "Current-Window Base ML Probability %", "Current-Window Probability %",
+        "Current-Window Intent", "Why This Current-Window Probability", "Recommended Action",
+        "Offered Date", "Deadline"
+    ]
+    summary_cols = ["Week", "Training Rows", "Converted", "Current Active Unpaid", "Avg Current Probability %", "High/Medium Intent", "Historical Active Conversion %"]
+    if feature_df is None or feature_df.empty or not SKLEARN_AVAILABLE:
+        return pd.DataFrame(columns=columns), pd.DataFrame(columns=summary_cols)
+
+    df = feature_df.copy()
+    needed = ["Actual Paid", "Offered Date", "Deadline", "student_id"]
+    if any(c not in df.columns for c in needed):
+        return pd.DataFrame(columns=columns), pd.DataFrame(columns=summary_cols)
+
+    today = get_today_ist()
+    df["_offered_dt"] = pd.to_datetime(df.get("Offered Date", pd.NaT), errors="coerce").dt.normalize()
+    df["_deadline_dt"] = pd.to_datetime(df.get("Deadline", pd.NaT), errors="coerce").dt.normalize()
+    df["_deadline_dt"] = df["_deadline_dt"].where(df["_deadline_dt"].notna(), df["_offered_dt"] + pd.Timedelta(days=30))
+    df["_today_dt"] = today
+    df["_days_since_offer"] = (df["_today_dt"] - df["_offered_dt"]).dt.days + 1
+    df["_days_left_deadline"] = (df["_deadline_dt"] - df["_today_dt"]).dt.days
+    df["_current_week"] = df["_days_since_offer"].apply(lambda x: int(max(1, min(4, np.ceil(float(x) / 7.0)))) if pd.notna(x) and float(x) > 0 else 0)
+
+    for c in ["touchpoints_week1", "touchpoints_week2", "touchpoints_week3", "touchpoints_week4"]:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).clip(lower=0)
+
+    # Conservative model features: no country, no batch, no eligibility, no full-window future counts.
+    # Each weekly model sees only week touchpoint counts up to that week.
+    out_rows = []
+    summary_rows = []
+    y_all = pd.to_numeric(df["Actual Paid"], errors="coerce").fillna(0).astype(int)
+    if y_all.nunique() < 2:
+        return pd.DataFrame(columns=columns), pd.DataFrame(columns=summary_cols)
+
+    for wk in [1, 2, 3, 4]:
+        week_cols = [f"touchpoints_week{i}" for i in range(1, wk + 1)]
+        train = df[df["_offered_dt"].notna()].copy()
+        if train.empty:
+            continue
+        train[f"_cum_w{wk}"] = train[week_cols].sum(axis=1)
+        train[f"_active_weeks_w{wk}"] = train[week_cols].gt(0).sum(axis=1)
+        train[f"_max_week_w{wk}"] = train[week_cols].max(axis=1)
+        train[f"_touchpoint_band_w{wk}"] = train[f"_cum_w{wk}"].map(_ml_week_touchpoint_band)
+        train[f"_activated_by_w{wk}"] = train[f"_cum_w{wk}"].gt(0).astype(int)
+
+        numeric_cols = week_cols + [f"_cum_w{wk}", f"_active_weeks_w{wk}", f"_max_week_w{wk}", f"_activated_by_w{wk}"]
+        cat_cols = [c for c in ["Course", "Income", "Community Acquired"] if c in train.columns]
+        X = train[numeric_cols + cat_cols].copy()
+        for c in numeric_cols:
+            X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0)
+        for c in cat_cols:
+            X[c] = X[c].astype(str).fillna("Unknown")
+        y = pd.to_numeric(train["Actual Paid"], errors="coerce").fillna(0).astype(int)
+        if y.nunique() < 2 or y.value_counts().min() < 5:
+            continue
+
+        try:
+            try:
+                encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False, min_frequency=5)
+            except TypeError:
+                try:
+                    encoder = OneHotEncoder(handle_unknown="ignore", sparse=False, min_frequency=5)
+                except TypeError:
+                    encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
+            preprocess = ColumnTransformer(
+                transformers=[("num", "passthrough", numeric_cols), ("cat", encoder, cat_cols)],
+                remainder="drop",
+            )
+            # Logistic Regression with balanced class weights is stable for this small weekly snapshot problem.
+            weekly_model = Pipeline(steps=[("preprocess", preprocess), ("model", LogisticRegression(max_iter=2000, class_weight="balanced", solver="liblinear", C=0.8))])
+            weekly_model.fit(X, y)
+        except Exception:
+            continue
+
+        hist = train.copy()
+        hist["_seg"] = hist[f"_touchpoint_band_w{wk}"].astype(str) + " | " + hist.get("Community Acquired", pd.Series("", index=hist.index)).astype(str)
+        hist_rates = hist.groupby("_seg").agg(rate=("Actual Paid", "mean"), n=("student_id", "nunique")).to_dict("index")
+        week_active = hist[hist[f"_cum_w{wk}"].gt(0)]
+        hist_active_rate = float(week_active["Actual Paid"].mean() * 100) if not week_active.empty else 0.0
+
+        current = df[
+            pd.to_numeric(df.get("Actual Paid", 0), errors="coerce").fillna(0).astype(int).eq(0)
+            & df["_offered_dt"].notna()
+            & df["_deadline_dt"].notna()
+            & df["_days_since_offer"].between(1, 31, inclusive="both")
+            & df["_days_left_deadline"].ge(0)
+            & df["_current_week"].eq(wk)
+        ].copy()
+        if current.empty:
+            summary_rows.append({"Week": f"Week {wk}", "Training Rows": int(len(train)), "Converted": int(y.sum()), "Current Active Unpaid": 0, "Avg Current Probability %": 0.0, "High/Medium Intent": 0, "Historical Active Conversion %": round(hist_active_rate, 1)})
+            continue
+        current[f"_cum_w{wk}"] = current[week_cols].sum(axis=1)
+        current = current[current[f"_cum_w{wk}"].gt(0)].copy()
+        if current.empty:
+            summary_rows.append({"Week": f"Week {wk}", "Training Rows": int(len(train)), "Converted": int(y.sum()), "Current Active Unpaid": 0, "Avg Current Probability %": 0.0, "High/Medium Intent": 0, "Historical Active Conversion %": round(hist_active_rate, 1)})
+            continue
+        current[f"_active_weeks_w{wk}"] = current[week_cols].gt(0).sum(axis=1)
+        current[f"_max_week_w{wk}"] = current[week_cols].max(axis=1)
+        current[f"_touchpoint_band_w{wk}"] = current[f"_cum_w{wk}"].map(_ml_week_touchpoint_band)
+        current[f"_activated_by_w{wk}"] = current[f"_cum_w{wk}"].gt(0).astype(int)
+        Xc = current[numeric_cols + cat_cols].copy()
+        for c in numeric_cols:
+            Xc[c] = pd.to_numeric(Xc[c], errors="coerce").fillna(0)
+        for c in cat_cols:
+            Xc[c] = Xc[c].astype(str).fillna("Unknown")
+        try:
+            base_prob = weekly_model.predict_proba(Xc)[:, 1]
+        except Exception:
+            base_prob = np.zeros(len(current))
+
+        current = current.reset_index(drop=True)
+        current["_base_prob"] = pd.to_numeric(pd.Series(base_prob), errors="coerce").fillna(0).clip(0, 1)
+        hist_probs = []
+        hist_ns = []
+        for _, cr in current.iterrows():
+            seg_key = str(cr.get(f"_touchpoint_band_w{wk}", "0")) + " | " + str(cr.get("Community Acquired", ""))
+            ref = hist_rates.get(seg_key)
+            if ref and ref.get("n", 0) >= 15:
+                hist_probs.append(float(ref.get("rate", 0)))
+                hist_ns.append(int(ref.get("n", 0)))
+            else:
+                band = str(cr.get(f"_touchpoint_band_w{wk}", "0"))
+                band_part = hist[hist[f"_touchpoint_band_w{wk}"].astype(str).eq(band)]
+                hist_probs.append(float(band_part["Actual Paid"].mean()) if not band_part.empty else float(y.mean()))
+                hist_ns.append(int(band_part["student_id"].nunique()) if not band_part.empty else int(len(hist)))
+        current["_hist_prob"] = hist_probs
+        current["_hist_n"] = hist_ns
+        current["_final_prob"] = ((current["_base_prob"] * 0.65) + (current["_hist_prob"] * 0.35)).clip(0, 0.90)
+        # Strong current-window activity can only support the score, not suppress it.
+        current.loc[current[f"_cum_w{wk}"].ge(4), "_final_prob"] = current.loc[current[f"_cum_w{wk}"].ge(4), "_final_prob"].clip(lower=0.38)
+        current.loc[current[f"_cum_w{wk}"].ge(6), "_final_prob"] = current.loc[current[f"_cum_w{wk}"].ge(6), "_final_prob"].clip(lower=0.48)
+
+        high_medium = 0
+        for _, cr in current.iterrows():
+            prob = float(cr.get("_final_prob", 0))
+            intent = _ml_weekly_prediction_band(prob)
+            if intent in {"High Current-Window Intent", "Medium Current-Window Intent"}:
+                high_medium += 1
+            out_rows.append({
+                "Name": clean_text(cr.get("Name", cr.get("student_name", ""))),
+                "Email": clean_text(cr.get("Email", cr.get("email_key", ""))),
+                "Program": clean_text(cr.get("Program", "")),
+                "Batch": clean_text(cr.get("Batch", "")),
+                "Course": clean_text(cr.get("Course", "")),
+                "Community Acquired": clean_text(cr.get("Community Acquired", "")),
+                "Current Status": clean_text(cr.get("Current Status", "")),
+                "Current Week": f"Week {wk}",
+                "Days Since Offer": int(cr.get("_days_since_offer", 0) or 0),
+                "Days Left To Deadline": int(cr.get("_days_left_deadline", 0) or 0),
+                "Touchpoints Till Current Week": int(cr.get(f"_cum_w{wk}", 0) or 0),
+                "Week 1": int(cr.get("touchpoints_week1", 0) or 0),
+                "Week 2": int(cr.get("touchpoints_week2", 0) or 0),
+                "Week 3": int(cr.get("touchpoints_week3", 0) or 0),
+                "Week 4": int(cr.get("touchpoints_week4", 0) or 0),
+                "Historical Segment Conversion %": round(float(cr.get("_hist_prob", 0) or 0) * 100, 1),
+                "Historical Segment Size": int(cr.get("_hist_n", 0) or 0),
+                "Current-Window Base ML Probability %": round(float(cr.get("_base_prob", 0) or 0) * 100, 1),
+                "Current-Window Probability %": round(prob * 100, 1),
+                "Current-Window Probability": round(prob, 6),
+                "Current-Window Intent": intent,
+                "Why This Current-Window Probability": f"Compared with historical paid/unpaid students using only activity through Week {wk} after offer. Student has {int(cr.get(f'_cum_w{wk}', 0) or 0)} touchpoints by day {int(cr.get('_days_since_offer', 0) or 0)}; similar historical segment converted at {round(float(cr.get('_hist_prob', 0) or 0) * 100, 1)}% across {int(cr.get('_hist_n', 0) or 0)} students.",
+                "Recommended Action": _ml_weekly_recommended_action(pd.Series({"Current Week": wk, "Current-Window Probability": prob, "Touchpoints Till Current Week": int(cr.get(f"_cum_w{wk}", 0) or 0), "Days Left To Deadline": int(cr.get("_days_left_deadline", 999) or 999)})),
+                "Offered Date": format_date_display(cr.get("_offered_dt", pd.NaT)),
+                "Deadline": format_date_display(cr.get("_deadline_dt", pd.NaT)),
+            })
+        summary_rows.append({
+            "Week": f"Week {wk}",
+            "Training Rows": int(len(train)),
+            "Converted": int(y.sum()),
+            "Current Active Unpaid": int(len(current)),
+            "Avg Current Probability %": round(float(current["_final_prob"].mean() * 100), 1) if not current.empty else 0.0,
+            "High/Medium Intent": int(high_medium),
+            "Historical Active Conversion %": round(hist_active_rate, 1),
+        })
+
+    result = pd.DataFrame(out_rows, columns=columns)
+    summary = pd.DataFrame(summary_rows, columns=summary_cols)
+    if not result.empty:
+        result = result.sort_values(["Current Week", "Current-Window Probability %"], ascending=[True, False]).reset_index(drop=True)
+    return result, summary
+
 def render_ml_predictions_page(data, program_filter: str = None, page_title: str = None, key_prefix: str = "ml"):
     target_program = clean_text(program_filter).upper() if program_filter else ""
     page_title = page_title or (f"ML Prediction - {target_program}" if target_program else "Tetr ML Prediction Dashboard")
@@ -12304,6 +12557,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         "Feature Importance",
         "Error Audit",
         "Training Data Audit",
+        "In-Window Weekly Predictions",
     ])
 
     with tabs[0]:
@@ -12685,6 +12939,52 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         audit_source_df = _ml_safe_display_df(feature_df)
         audit_cols = [c for c in audit_cols if c in audit_source_df.columns]
         st.dataframe(_ml_safe_display_df(audit_source_df[audit_cols]), use_container_width=True, height=560, hide_index=True, key=_ml_key("ml_training_audit_table"))
+
+
+    with tabs[11]:
+        st.markdown("#### Active in-window weekly prediction")
+        st.caption(
+            "Scores currently active unpaid students who are still between Offered Date and Deadline. "
+            "Week 1/2/3/4 models compare each current student only with historical paid/unpaid patterns available up to the same week after offer, so paid-student data is cut to the same journey age."
+        )
+        weekly_df, weekly_summary_df = build_ml_in_window_weekly_predictions(feature_df, threshold_mode=threshold_mode)
+        if weekly_summary_df is not None and not weekly_summary_df.empty:
+            st.markdown("##### Weekly current-window summary")
+            st.dataframe(weekly_summary_df, use_container_width=True, hide_index=True, key=_ml_key("ml_weekly_in_window_summary"))
+            chart_df = weekly_summary_df.copy()
+            if not chart_df.empty:
+                fig = px.bar(chart_df, x="Week", y="Current Active Unpaid", text="Current Active Unpaid", title="Active unpaid students currently inside offer-to-deadline window")
+                fig.update_traces(marker_color=GREEN_2, textposition="outside")
+                st.plotly_chart(nice_layout(fig, height=340), use_container_width=True, key=_ml_key("ml_weekly_in_window_bar"))
+        if weekly_df is None or weekly_df.empty:
+            st.info("No active unpaid students are currently inside their Offered Date → Deadline window, or weekly model data is unavailable. Click Predict if the displayed feature set is old/missing.")
+        else:
+            week_values = ["Week 1", "Week 2", "Week 3", "Week 4"]
+            selected_weeks = st.multiselect("Current journey week", week_values, default=week_values, key=_ml_key("ml_weekly_window_filter"))
+            intent_values = ["High Current-Window Intent", "Medium Current-Window Intent", "Low Current-Window Intent", "Needs More Activation"]
+            selected_intents = st.multiselect("Current-window intent", intent_values, default=intent_values, key=_ml_key("ml_weekly_intent_filter"))
+            show_weekly = weekly_df.copy()
+            if selected_weeks:
+                show_weekly = show_weekly[show_weekly["Current Week"].astype(str).isin(selected_weeks)]
+            if selected_intents:
+                show_weekly = show_weekly[show_weekly["Current-Window Intent"].astype(str).isin(selected_intents)]
+            st.dataframe(
+                show_weekly.sort_values(["Current Week", "Current-Window Probability %"], ascending=[True, False]),
+                use_container_width=True,
+                hide_index=True,
+                height=620,
+                key=_ml_key("ml_weekly_in_window_table"),
+            )
+            st.markdown("##### Logic used")
+            st.markdown(
+                """
+                - **Scope:** unpaid students only, active inside Offered Date → Deadline.
+                - **Week 1/2/3/4:** the student is compared against historical paid/unpaid students using only touchpoint counts available through the same week after offer.
+                - **Payment safety:** Tetr-X post-payment events are excluded; paid students are represented only by their batch-sheet activity patterns before payment / up to the same journey week.
+                - **Signals used:** weekly touchpoint counts, cumulative touchpoints till that week, active weeks till that week, Course, Income, and Community Acquired. Country and Batch are not used for scoring.
+                - **Historical calibration:** probability blends a lightweight weekly ML model with conversion rate from similar historical weekly segments.
+                """
+            )
 
 
 def main():
