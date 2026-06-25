@@ -316,6 +316,178 @@ def _ml_model_bundle_summary(bundle: dict | None) -> str:
     return " · ".join(bits)
 
 
+# ---------------- ML prediction persistence ----------------
+# Saved prediction bundles let the dashboard open instantly with the last scored
+# unpaid/student table. A new live scoring run happens only when Predict is clicked.
+ML_PREDICTION_DIR = Path(__file__).resolve().parent / "ml_saved_predictions"
+
+
+def _ml_prediction_bundle_path(program_filter: str = "") -> Path:
+    return ML_PREDICTION_DIR / f"payment_predictions_{_ml_model_file_prefix(program_filter).replace('payment_model_', '')}.joblib"
+
+
+def _ml_prediction_repo_path(program_filter: str = "") -> str:
+    return f"ml_saved_predictions/{_ml_prediction_bundle_path(program_filter).name}"
+
+
+def _ml_pull_prediction_file_from_github(program_filter: str, local_path: Path) -> tuple[bool, str]:
+    """Download the last saved prediction bundle from GitHub into runtime."""
+    cfg = _ml_get_github_model_config()
+    if not cfg:
+        return False, "GitHub prediction download is not configured."
+
+    owner, repo, branch, token = cfg["owner"], cfg["repo"], cfg["branch"], cfg["token"]
+    repo_path = _ml_prediction_repo_path(program_filter)
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{repo_path}?ref={branch}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "tetr-ml-prediction-dashboard",
+    }
+    try:
+        req = urllib.request.Request(api_url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            meta = json.loads(resp.read().decode("utf-8"))
+
+        raw_bytes = b""
+        content = meta.get("content")
+        encoding = clean_text(meta.get("encoding", "")).lower() if "clean_text" in globals() else str(meta.get("encoding", "")).lower()
+        if content and encoding == "base64":
+            raw_bytes = base64.b64decode(str(content).replace("\n", ""))
+        else:
+            download_url = meta.get("download_url")
+            if not download_url:
+                return False, f"GitHub prediction file was found but no downloadable content was returned for {repo_path}."
+            raw_req = urllib.request.Request(download_url, headers=headers, method="GET")
+            with urllib.request.urlopen(raw_req, timeout=90) as raw_resp:
+                raw_bytes = raw_resp.read()
+
+        if not raw_bytes:
+            return False, f"Downloaded GitHub prediction file is empty: {repo_path}"
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(raw_bytes)
+        return True, f"Downloaded saved predictions from GitHub: {repo_path}"
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False, f"No saved predictions found in GitHub at {repo_path}"
+        try:
+            detail = e.read().decode("utf-8")[:500]
+        except Exception:
+            detail = ""
+        return False, f"GitHub prediction download failed ({e.code}). {detail}"
+    except Exception as e:
+        return False, f"GitHub prediction download failed: {e}"
+
+
+def _ml_load_prediction_bundle(program_filter: str) -> tuple[dict | None, str]:
+    """Load last saved prediction bundle from local/repo checkout or GitHub."""
+    try:
+        path = _ml_prediction_bundle_path(program_filter)
+        source_notes = []
+        if not path.exists():
+            pulled, pull_msg = _ml_pull_prediction_file_from_github(program_filter, path)
+            source_notes.append(pull_msg)
+            if not pulled and not path.exists():
+                return None, f"No saved predictions found at {path}. {pull_msg}"
+        bundle = joblib.load(path)
+        if not isinstance(bundle, dict) or bundle.get("scored_df") is None:
+            return None, f"Saved prediction file exists but is not a valid prediction bundle: {path}"
+        note = f"Loaded saved predictions from {path}"
+        if source_notes:
+            note += " · " + " · ".join([m for m in source_notes if m])
+        return bundle, note
+    except Exception as e:
+        return None, f"Could not load saved predictions: {e}"
+
+
+def _ml_save_prediction_bundle(program_filter: str, bundle: dict) -> tuple[bool, str]:
+    """Save the currently displayed/scored predictions locally and to GitHub."""
+    try:
+        if not isinstance(bundle, dict) or bundle.get("scored_df") is None:
+            return False, "No prediction data is available to save. Click Predict first, or load existing saved predictions."
+        ML_PREDICTION_DIR.mkdir(parents=True, exist_ok=True)
+        payload = dict(bundle)
+        payload["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload["program_filter"] = clean_text(program_filter).upper() if program_filter else "ALL"
+        path = _ml_prediction_bundle_path(program_filter)
+        joblib.dump(payload, path, compress=3)
+        repo_root = Path(__file__).resolve().parent
+        try:
+            repo_path = path.relative_to(repo_root).as_posix()
+        except Exception:
+            repo_path = _ml_prediction_repo_path(program_filter)
+        cfg = _ml_get_github_model_config()
+        gh_ok, gh_msg = _ml_push_file_to_github(path, repo_path)
+        if gh_ok:
+            return True, f"Saved prediction bundle locally to {path} and pushed to GitHub. {gh_msg}"
+        if cfg:
+            return False, f"Saved predictions locally to {path}, but GitHub upload failed. {gh_msg}"
+        return True, f"Saved prediction bundle locally to {path}. {gh_msg}"
+    except Exception as e:
+        return False, f"Could not save predictions: {e}"
+
+
+def _ml_prediction_bundle_summary(bundle: dict | None) -> str:
+    if not bundle:
+        return "No prediction bundle loaded."
+    saved_at = clean_text(bundle.get("saved_at", bundle.get("predicted_at", ""))) or "unknown time"
+    program = clean_text(bundle.get("program_filter", "")) or "ALL"
+    scored_df = bundle.get("scored_df", pd.DataFrame())
+    rows = len(scored_df) if isinstance(scored_df, pd.DataFrame) else ""
+    model_name = clean_text(bundle.get("model_name", "")) or "Saved model"
+    bits = [f"Program: {program}", f"Predicted/Saved: {saved_at}", f"Model: {model_name}"]
+    if rows != "":
+        bits.append(f"Rows: {rows:,}")
+    mode = clean_text(bundle.get("threshold_mode", ""))
+    if mode:
+        bits.append(f"Threshold mode: {mode}")
+    return " · ".join(bits)
+
+
+def _ml_make_prediction_bundle(program_filter: str, scored_df: pd.DataFrame, feature_df: pd.DataFrame,
+                               train_df: pd.DataFrame, event_intel_df: pd.DataFrame,
+                               group_intel_df: pd.DataFrame, event_rows_df: pd.DataFrame,
+                               perf_df: pd.DataFrame, confusion_df: pd.DataFrame,
+                               importance_df: pd.DataFrame, error_audit_df: pd.DataFrame,
+                               program_perf_df: pd.DataFrame, threshold_mode: str, model=None) -> dict:
+    return {
+        "program_filter": clean_text(program_filter).upper() if program_filter else "ALL",
+        "predicted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "threshold_mode": clean_text(threshold_mode),
+        "model_name": clean_text(getattr(model, "ml_model_name_", "")) or "Saved model",
+        "scored_df": _ml_safe_display_df(scored_df) if isinstance(scored_df, pd.DataFrame) else pd.DataFrame(),
+        "feature_df": _ml_safe_display_df(feature_df) if isinstance(feature_df, pd.DataFrame) else pd.DataFrame(),
+        "train_df": _ml_safe_display_df(train_df) if isinstance(train_df, pd.DataFrame) else pd.DataFrame(),
+        "event_intel_df": _ml_safe_display_df(event_intel_df) if isinstance(event_intel_df, pd.DataFrame) else pd.DataFrame(),
+        "group_intel_df": _ml_safe_display_df(group_intel_df) if isinstance(group_intel_df, pd.DataFrame) else pd.DataFrame(),
+        "event_rows_df": _ml_safe_display_df(event_rows_df) if isinstance(event_rows_df, pd.DataFrame) else pd.DataFrame(),
+        "perf_df": _ml_safe_display_df(perf_df) if isinstance(perf_df, pd.DataFrame) else pd.DataFrame(),
+        "confusion_df": _ml_safe_display_df(confusion_df) if isinstance(confusion_df, pd.DataFrame) else pd.DataFrame(),
+        "importance_df": _ml_safe_display_df(importance_df) if isinstance(importance_df, pd.DataFrame) else pd.DataFrame(),
+        "error_audit_df": _ml_safe_display_df(error_audit_df) if isinstance(error_audit_df, pd.DataFrame) else pd.DataFrame(),
+        "program_perf_df": _ml_safe_display_df(program_perf_df) if isinstance(program_perf_df, pd.DataFrame) else pd.DataFrame(),
+    }
+
+
+def _ml_restore_prediction_bundle(bundle: dict) -> dict:
+    if not isinstance(bundle, dict):
+        bundle = {}
+    return {
+        "scored_df": bundle.get("scored_df", pd.DataFrame()) if isinstance(bundle.get("scored_df", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "feature_df": bundle.get("feature_df", pd.DataFrame()) if isinstance(bundle.get("feature_df", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "train_df": bundle.get("train_df", pd.DataFrame()) if isinstance(bundle.get("train_df", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "event_intel_df": bundle.get("event_intel_df", pd.DataFrame()) if isinstance(bundle.get("event_intel_df", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "group_intel_df": bundle.get("group_intel_df", pd.DataFrame()) if isinstance(bundle.get("group_intel_df", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "event_rows_df": bundle.get("event_rows_df", pd.DataFrame()) if isinstance(bundle.get("event_rows_df", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "perf_df": bundle.get("perf_df", pd.DataFrame()) if isinstance(bundle.get("perf_df", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "confusion_df": bundle.get("confusion_df", pd.DataFrame()) if isinstance(bundle.get("confusion_df", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "importance_df": bundle.get("importance_df", pd.DataFrame()) if isinstance(bundle.get("importance_df", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "error_audit_df": bundle.get("error_audit_df", pd.DataFrame()) if isinstance(bundle.get("error_audit_df", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+        "program_perf_df": bundle.get("program_perf_df", pd.DataFrame()) if isinstance(bundle.get("program_perf_df", pd.DataFrame()), pd.DataFrame) else pd.DataFrame(),
+    }
+
+
 def inject_css():
     st.markdown(
         f"""
@@ -9357,6 +9529,8 @@ def _ml_student_reason(row: pd.Series) -> str:
             reasons.append(f"late-intent signal: reactivated {gap} day{'s' if gap != 1 else ''} after deadline with {pd_tp} late touchpoint{'s' if pd_tp != 1 else ''}")
         if pd_meaningful > 0:
             reasons.append(f"late-interest signal: {pd_meaningful} meaningful post-deadline touchpoint{'s' if pd_meaningful != 1 else ''}")
+        if int(row.get("reactivated_similar_to_late_payers", 0) or 0) > 0:
+            reasons.append(f"resembles historical paid-after-deadline pattern: {clean_text(row.get('Late Payment Pattern', ''))}")
 
     group_map = _ml_event_group_feature_map()
     hit_groups = []
@@ -9385,6 +9559,8 @@ def _ml_recommended_actions(row: pd.Series) -> str:
 
     if int(row.get("reactivated_after_deadline", 0) or 0) > 0:
         actions.append("prioritize fast counsellor follow-up: student reactivated after deadline")
+    if int(row.get("reactivated_similar_to_late_payers", 0) or 0) > 0:
+        actions.append("treat as late-conversion lead: compare with paid-after-deadline patterns and push payment clarity now")
     if not bool(row.get("community_acquired", False)):
         actions.append("move into community / WA flow first")
     if total == 0:
@@ -9610,6 +9786,165 @@ def _ml_engagement_quality_label(raw_label: str) -> str:
         "No Impact": "No Engagement",
     }.get(clean_text(raw_label), clean_text(raw_label) or "No Engagement")
 
+
+
+def _ml_build_batch_attendance_index(data: dict) -> pd.DataFrame:
+    """Build attended-event rows from batch sheets only for ML conversion modeling.
+
+    Tetr-X sheets are deliberately excluded because their event columns represent
+    post-payment participation/retention behavior. The payment model must learn
+    only from pre-payment / offer-journey behavior captured in UG/PG batch sheets.
+    Payment dates are applied later per student so converted rows are still
+    capped before payment.
+    """
+    rows = []
+    activities = data.get("activities", {}) if isinstance(data, dict) else {}
+    activity_ctx = data.get("activity_ctx", {}) if isinstance(data, dict) else {}
+    batch_sheets = [s for s in (UG_BATCH_SHEETS + PG_BATCH_SHEETS) if s in activities and s in activity_ctx]
+
+    for sheet in batch_sheets:
+        sdf = activities.get(sheet, pd.DataFrame())
+        ctx = activity_ctx.get(sheet, {})
+        event_info = ctx.get("event_info", pd.DataFrame()) if isinstance(ctx, dict) else pd.DataFrame()
+        if sdf is None or sdf.empty or event_info is None or event_info.empty:
+            continue
+        id_cols = [c for c in ["email_key", "student_key", "student_name"] if c in sdf.columns]
+        if not id_cols:
+            continue
+        base_ids = sdf[id_cols].copy()
+        for c in ["email_key", "student_key", "student_name"]:
+            if c not in base_ids.columns:
+                base_ids[c] = ""
+        base_ids["student_id"] = base_ids.apply(
+            lambda r: clean_text(r.get("email_key", "")) or clean_text(r.get("student_key", "")) or normalize_name(r.get("student_name", "")),
+            axis=1,
+        )
+        base_ids = base_ids[base_ids["student_id"].astype(str).str.len() > 0]
+        if base_ids.empty:
+            continue
+
+        for _, ev in event_info.iterrows():
+            col = ev.get("column_name")
+            if not col or col not in sdf.columns:
+                continue
+            attended_mask = pd.to_numeric(sdf[col], errors="coerce").fillna(0).gt(0)
+            if not attended_mask.any():
+                continue
+            ev_name = clean_text(ev.get("event_name", "")) or clean_text(col)
+            ev_type = clean_text(ev.get("event_type", "")) or "Other"
+            ev_date = pd.to_datetime(ev.get("event_date", pd.NaT), errors="coerce")
+            if pd.isna(ev_date):
+                continue
+            ev_date_norm = ev_date.normalize()
+            bucket = _community_impact_event_bucket(ev_type)
+            group = _ml_event_group(ev_name, ev_type)
+            event_identity_key = _ml_event_identity_key(ev_name, ev_type, ev_date_norm)
+            part = base_ids.loc[attended_mask.reindex(base_ids.index, fill_value=False), ["student_id", "email_key", "student_key", "student_name"]].copy()
+            if part.empty:
+                continue
+            part["event_name"] = ev_name
+            part["event_type"] = ev_type
+            part["event_date"] = ev_date_norm
+            part["event_bucket"] = bucket
+            part["event_group"] = group
+            part["event_identity_key"] = event_identity_key
+            part["source_sheets"] = sheet
+            rows.append(part)
+
+    if not rows:
+        return pd.DataFrame(columns=["student_id", "email_key", "student_key", "student_name", "event_name", "event_type", "event_date", "event_bucket", "event_group", "event_identity_key", "source_sheets"])
+
+    out = pd.concat(rows, ignore_index=True)
+    out = (
+        out.sort_values(["event_date", "event_name", "source_sheets"], na_position="last")
+        .groupby(["student_id", "event_identity_key"], as_index=False)
+        .agg({
+            "email_key": "first",
+            "student_key": "first",
+            "student_name": "first",
+            "event_name": "first",
+            "event_type": "first",
+            "event_date": "first",
+            "event_bucket": "first",
+            "event_group": "first",
+            "source_sheets": lambda x: ", ".join(sorted(dict.fromkeys([clean_text(v) for v in x if clean_text(v)]))),
+        })
+    )
+    return out.reset_index(drop=True)
+
+
+def _ml_late_payment_pattern_label(row) -> str:
+    try:
+        post_meaningful = int(float(row.get("post_deadline_meaningful_touchpoints", 0) or 0))
+        post_total = int(float(row.get("post_deadline_touchpoints", 0) or 0))
+        post_regular = int(float(row.get("post_deadline_regular_participation_signal", 0) or 0))
+        post_one_miss = int(float(row.get("post_deadline_one_miss_7_event_pattern", 0) or 0))
+        post_gap = int(float(row.get("post_deadline_compact_activity_gap_pattern", 0) or 0))
+        late_hi = int(float(row.get("post_deadline_high_impact_group_touchpoints", 0) or 0))
+        react_gap = float(row.get("reactivation_gap_days", 999) or 999)
+    except Exception:
+        post_meaningful = post_total = post_regular = post_one_miss = post_gap = late_hi = 0
+        react_gap = 999
+    if post_meaningful >= 4 or post_one_miss > 0 or post_regular > 0:
+        return "Strong late-conversion pattern"
+    if post_meaningful >= 2 or late_hi >= 2 or post_gap > 0:
+        return "Meaningful reactivation pattern"
+    if post_total > 0 and react_gap <= 10:
+        return "Quick reactivation after deadline"
+    if post_total > 0:
+        return "Light late reactivation"
+    return "No late reactivation"
+
+
+def build_ml_late_payment_pattern_intelligence(feature_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Identify historical paid-after-deadline students and summarize their late patterns."""
+    pattern_cols = [
+        "Late Pattern", "Students", "Paid After Deadline", "Conversion %", "Avg Days Deadline to Payment",
+        "Avg Post-Deadline Touchpoints", "Avg Post-Deadline Meaningful", "% Regular Late Pattern", "% One-Miss Late Pattern", "% Compact Gap Late Pattern"
+    ]
+    student_cols = [
+        "Name", "Email", "Program", "Batch", "Course", "Current Status", "Deadline", "Payment Date",
+        "days_deadline_to_payment", "Late Payment Pattern", "late_payment_pattern_score",
+        "post_deadline_touchpoints", "post_deadline_meaningful_touchpoints", "post_deadline_online_masterclass_count",
+        "post_deadline_competition_count", "post_deadline_high_impact_group_touchpoints", "post_deadline_regular_participation_signal",
+        "post_deadline_one_miss_7_event_pattern", "post_deadline_compact_activity_gap_pattern", "reactivation_gap_days"
+    ]
+    if feature_df is None or feature_df.empty:
+        return pd.DataFrame(columns=student_cols), pd.DataFrame(columns=pattern_cols)
+    df = feature_df.copy()
+    for c in ["Actual Paid", "paid_after_deadline", "days_deadline_to_payment", "post_deadline_touchpoints", "post_deadline_meaningful_touchpoints", "post_deadline_regular_participation_signal", "post_deadline_one_miss_7_event_pattern", "post_deadline_compact_activity_gap_pattern"]:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    if "Late Payment Pattern" not in df.columns:
+        df["Late Payment Pattern"] = df.apply(_ml_late_payment_pattern_label, axis=1)
+    paid_late = df[df["paid_after_deadline"].astype(int).eq(1)].copy()
+    paid_late_show = paid_late[[c for c in student_cols if c in paid_late.columns]].copy() if not paid_late.empty else pd.DataFrame(columns=student_cols)
+    if not paid_late_show.empty:
+        paid_late_show = paid_late_show.sort_values(["late_payment_pattern_score", "post_deadline_meaningful_touchpoints", "days_deadline_to_payment"], ascending=[False, False, True]).reset_index(drop=True)
+
+    rows = []
+    for pattern, part in df.groupby("Late Payment Pattern", dropna=False):
+        students = int(part.get("student_id", pd.Series(index=part.index, dtype=str)).astype(str).nunique()) if "student_id" in part.columns else int(len(part))
+        paid_count = int(pd.to_numeric(part.get("paid_after_deadline", 0), errors="coerce").fillna(0).astype(int).sum())
+        paid_mask = pd.to_numeric(part.get("paid_after_deadline", 0), errors="coerce").fillna(0).astype(int).eq(1)
+        days = pd.to_numeric(part.loc[paid_mask, "days_deadline_to_payment"], errors="coerce").replace(999, np.nan) if "days_deadline_to_payment" in part.columns else pd.Series(dtype=float)
+        rows.append({
+            "Late Pattern": clean_text(pattern) or "Unknown",
+            "Students": students,
+            "Paid After Deadline": paid_count,
+            "Conversion %": round(paid_count / students * 100, 1) if students else 0.0,
+            "Avg Days Deadline to Payment": round(float(days.mean()), 1) if days.notna().any() else np.nan,
+            "Avg Post-Deadline Touchpoints": round(float(pd.to_numeric(part.get("post_deadline_touchpoints", 0), errors="coerce").fillna(0).mean()), 2) if students else 0.0,
+            "Avg Post-Deadline Meaningful": round(float(pd.to_numeric(part.get("post_deadline_meaningful_touchpoints", 0), errors="coerce").fillna(0).mean()), 2) if students else 0.0,
+            "% Regular Late Pattern": round(float(pd.to_numeric(part.get("post_deadline_regular_participation_signal", 0), errors="coerce").fillna(0).mean() * 100), 1) if students else 0.0,
+            "% One-Miss Late Pattern": round(float(pd.to_numeric(part.get("post_deadline_one_miss_7_event_pattern", 0), errors="coerce").fillna(0).mean() * 100), 1) if students else 0.0,
+            "% Compact Gap Late Pattern": round(float(pd.to_numeric(part.get("post_deadline_compact_activity_gap_pattern", 0), errors="coerce").fillna(0).mean() * 100), 1) if students else 0.0,
+        })
+    summary = pd.DataFrame(rows, columns=pattern_cols)
+    if not summary.empty:
+        summary = summary.sort_values(["Conversion %", "Paid After Deadline", "Students"], ascending=[False, False, False]).reset_index(drop=True)
+    return paid_late_show, summary
 
 def _ml_build_eligible_event_index(data: dict) -> dict:
     """Map each student key to events they were eligible to attend.
@@ -10076,7 +10411,10 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None, program_filt
     # Refunded students are counted as converted because they paid once.
     paid_mask = pd.Series([is_paid_status_for_program(s, p) for s, p in zip(status_source, program_series)], index=base.index).astype(bool) | refund_mask
 
-    activity_index = data.get("all_time_student_activity_index", pd.DataFrame()) if isinstance(data, dict) else pd.DataFrame()
+    # ML event features must come from batch sheets only. Tetr-X event columns are
+    # post-payment/retention participation and are intentionally excluded from
+    # conversion model training, event intelligence, and live scoring.
+    activity_index = _ml_build_batch_attendance_index(data)
     if activity_index is not None and not activity_index.empty:
         aidx = activity_index.copy()
         aidx["event_date"] = pd.to_datetime(aidx.get("event_date", pd.NaT), errors="coerce").dt.normalize()
@@ -10098,7 +10436,7 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None, program_filt
             }
             for k in [x for x in keys if x]:
                 key_to_indices.setdefault(k, []).append(idx)
-        _ml_progress(progress_callback, 22, f"Indexed {len(aidx):,} activity rows across all sheets.")
+        _ml_progress(progress_callback, 22, f"Indexed {len(aidx):,} attended batch-sheet activity rows. Tetr-X post-payment events are excluded.")
     else:
         aidx = pd.DataFrame()
         key_to_indices = {}
@@ -10146,6 +10484,15 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None, program_filt
             deadline_dt = deadline_dt.normalize()
         if pd.notna(payment_dt):
             payment_dt = payment_dt.normalize()
+        paid_after_deadline = 0
+        days_deadline_to_payment = 999
+        if is_paid and pd.notna(payment_dt) and pd.notna(deadline_dt):
+            try:
+                days_deadline_to_payment = int((payment_dt - deadline_dt).days)
+                paid_after_deadline = int(days_deadline_to_payment > 0)
+            except Exception:
+                paid_after_deadline = 0
+                days_deadline_to_payment = 999
         first30_end = pd.NaT
         if pd.notna(offered_dt):
             first30_end = deadline_dt if pd.notna(deadline_dt) else offered_dt + pd.Timedelta(days=30)
@@ -10328,6 +10675,8 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None, program_filt
             "Status Reference Signal": _ml_status_reference_signal(clean_text(status_source.loc[idx]) if idx in status_source.index else ""),
             "Actual Paid": int(is_paid),
             "Refund / Later Refunded": int(is_refund),
+            "paid_after_deadline": int(paid_after_deadline),
+            "days_deadline_to_payment": int(days_deadline_to_payment),
             "training_included": 1,
             "total_touchpoints": total_touchpoints,
             "active_days": active_days,
@@ -10460,6 +10809,28 @@ def build_ml_prediction_dataset(data: dict, progress_callback=None, program_filt
         row["reactivation_quality_signal"] = int(row["post_deadline_meaningful_touchpoints"] > 0)
         row["safe_total_touchpoints_including_late"] = int(row["total_touchpoints"] + row["post_deadline_touchpoints"])
         row["safe_meaningful_touchpoints_including_late"] = int(row["meaningful_touchpoints"] + row["post_deadline_meaningful_touchpoints"])
+        # Late-payment/reactivation pattern score is payment-safe: for converted
+        # students it uses only post-deadline activity before payment; for unpaid
+        # students it uses current post-deadline behavior. It helps identify unpaid
+        # reactivated students who resemble historical paid-after-deadline students.
+        late_score = 0.0
+        if row.get("reactivated_after_deadline", 0):
+            late_score += 0.8
+        late_score += min(float(row.get("post_deadline_meaningful_touchpoints", 0) or 0), 4.0) * 0.65
+        late_score += min(float(row.get("post_deadline_high_impact_group_touchpoints", 0) or 0), 3.0) * 0.70
+        if int(row.get("post_deadline_regular_participation_signal", 0) or 0) > 0:
+            late_score += 1.00
+        if int(row.get("post_deadline_one_miss_7_event_pattern", 0) or 0) > 0:
+            late_score += 1.00
+        if int(row.get("post_deadline_compact_activity_gap_pattern", 0) or 0) > 0:
+            late_score += 0.75
+        if float(row.get("reactivation_gap_days", 999) or 999) <= 10:
+            late_score += 0.45
+        elif float(row.get("reactivation_gap_days", 999) or 999) <= 21:
+            late_score += 0.25
+        row["late_payment_pattern_score"] = round(late_score, 4)
+        row["reactivated_similar_to_late_payers"] = int(row["late_payment_pattern_score"] >= 2.25)
+        row["Late Payment Pattern"] = _ml_late_payment_pattern_label(row)
         row["general_only"] = int(total_touchpoints > 0 and row["general_fun_count"] == total_touchpoints and row["winner_spotlight_count"] == 0)
         row["no_activity_in_community"] = int(community_acquired and total_touchpoints == 0)
         row["active_out_community"] = int((not community_acquired) and total_touchpoints > 0)
@@ -10657,6 +11028,7 @@ def _ml_feature_columns(df: pd.DataFrame):
         "post_deadline_online_masterclass_count", "post_deadline_competition_count",
         "post_deadline_general_fun_count", "post_deadline_meaningful_touchpoints",
         "reactivation_quality_signal", "safe_total_touchpoints_including_late", "safe_meaningful_touchpoints_including_late",
+        "late_payment_pattern_score", "reactivated_similar_to_late_payers",
     ]
     numeric_cols = [c for c in base_numeric if c in df.columns]
     numeric_cols = list(dict.fromkeys(numeric_cols))
@@ -10761,6 +11133,18 @@ def _ml_probability_band_gated(row: pd.Series) -> str:
     if p >= 0.25:
         return "Low Intent"
     return "Cold"
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def build_ml_prediction_dataset_cached(data: dict, program_filter: str = ""):
+    """Cached ML feature dataset builder.
+
+    This is used on normal page reloads with a saved model so the app does not
+    rebuild the full event/sequence feature set every time. It follows the same
+    600-second freshness policy as the live Google Sheets read. Manual training
+    bypasses this cache so Train / Re-train Model Now always uses a fresh build.
+    """
+    return build_ml_prediction_dataset(data, progress_callback=None, program_filter=program_filter)
 
 
 def train_ml_payment_models(train_df: pd.DataFrame, preferred_model: str = "Gradient Boosting", progress_callback=None, progress_start: int = 62, progress_end: int = 88):
@@ -11217,8 +11601,9 @@ def _ml_has_genuine_high_intent_evidence(row: pd.Series) -> bool:
         meaningful4 = int(float(row.get("four_plus_meaningful_participation", 0) or 0))
         pattern = int(float(row.get("regular_participation_signal", 0) or 0))
         post_meaningful = int(float(row.get("post_deadline_meaningful_touchpoints", 0) or 0))
+        late_like = int(float(row.get("reactivated_similar_to_late_payers", 0) or 0))
     except Exception:
-        meaningful = winner = high_impact = meaningful4 = pattern = post_meaningful = 0
+        meaningful = winner = high_impact = meaningful4 = pattern = post_meaningful = late_like = 0
     status_group = _ml_status_reference_group(row.get("Current Status", ""))
     eq = clean_text(row.get("Engagement Quality", ""))
     return bool(
@@ -11229,6 +11614,7 @@ def _ml_has_genuine_high_intent_evidence(row: pd.Series) -> bool:
         or meaningful4 > 0
         or pattern > 0
         or post_meaningful >= 2
+        or late_like > 0
         or (status_group == "Positive Status" and meaningful >= 1)
     )
 
@@ -11357,6 +11743,8 @@ def _ml_positive_engagement_uplift(row: pd.Series) -> float:
     regular_pattern = _num("regular_participation_signal")
     post_pattern = _num("post_deadline_regular_participation_signal")
     post_meaningful = _num("post_deadline_meaningful_touchpoints")
+    late_score = _num("late_payment_pattern_score")
+    late_like = _num("reactivated_similar_to_late_payers")
 
     if int(row.get("community_acquired", 0) or 0) > 0:
         uplift += 0.015
@@ -11386,6 +11774,9 @@ def _ml_positive_engagement_uplift(row: pd.Series) -> float:
     uplift += min(post_meaningful, 3) * 0.018
     if post_pattern > 0:
         uplift += 0.015
+    if late_like > 0:
+        uplift += 0.025
+    uplift += min(late_score / 5.0, 1.0) * 0.025
     if int(row.get("reactivated_after_deadline", 0) or 0) > 0:
         uplift += 0.018
     if int(row.get("activated_week1", 0) or 0) > 0:
@@ -11434,6 +11825,8 @@ def _ml_positive_probability_floor(row: pd.Series) -> float:
     one_miss = _int("one_miss_7_event_pattern")
     regular_pattern = _int("regular_participation_signal")
     compact_gap = _int("compact_activity_gap_pattern")
+    late_like = _int("reactivated_similar_to_late_payers")
+    late_score = _int("late_payment_pattern_score")
 
     floor = 0.0
     if winner > 0:
@@ -11467,6 +11860,10 @@ def _ml_positive_probability_floor(row: pd.Series) -> float:
         floor = max(floor, 0.48)
     elif regular_pattern > 0 or compact_gap > 0:
         floor = max(floor, 0.38)
+    if late_like > 0:
+        floor = max(floor, 0.40)
+    elif late_score >= 2:
+        floor = max(floor, 0.34)
     if post_meaningful >= 2:
         floor = max(floor, 0.36)
     elif post_meaningful >= 1:
@@ -11602,32 +11999,56 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
 
     st.markdown("#### Model training controls")
     session_bundle_key = _ml_key("active_model_bundle")
-    existing_session_bundle = st.session_state.get(session_bundle_key)
-    existing_saved_bundle, existing_saved_msg = _ml_load_model_bundle(target_program)
-    has_existing_model = (isinstance(existing_session_bundle, dict) and existing_session_bundle.get("model") is not None) or (isinstance(existing_saved_bundle, dict) and existing_saved_bundle.get("model") is not None)
+    prediction_bundle_key = _ml_key("active_prediction_bundle")
 
-    c_train, c_save, c_status = st.columns([1.1, 1.15, 3.85])
+    existing_session_bundle = st.session_state.get(session_bundle_key)
+    existing_prediction_session = st.session_state.get(prediction_bundle_key)
+    existing_saved_bundle, existing_saved_msg = _ml_load_model_bundle(target_program)
+    existing_prediction_bundle, existing_prediction_msg = _ml_load_prediction_bundle(target_program)
+
+    has_existing_model = (
+        (isinstance(existing_session_bundle, dict) and existing_session_bundle.get("model") is not None)
+        or (isinstance(existing_saved_bundle, dict) and existing_saved_bundle.get("model") is not None)
+    )
+    has_existing_predictions = (
+        (isinstance(existing_prediction_session, dict) and isinstance(existing_prediction_session.get("scored_df"), pd.DataFrame) and not existing_prediction_session.get("scored_df").empty)
+        or (isinstance(existing_prediction_bundle, dict) and isinstance(existing_prediction_bundle.get("scored_df"), pd.DataFrame) and not existing_prediction_bundle.get("scored_df").empty)
+    )
+
+    c_train, c_predict, c_save_model, c_save_pred, c_status = st.columns([1.05, 0.9, 1.2, 1.1, 3.25])
     with c_train:
         train_clicked = st.button("Train / Re-train Model Now", type="primary", key=_ml_key("train_model_now"))
-    # Save is intentionally always clickable. If no bundle exists, it shows a clear
-    # message. This avoids Streamlit's disabled-button/session timing issue after a
-    # fresh training run. Save never trains or rebuilds features.
-    with c_save:
+    with c_predict:
+        predict_clicked = st.button("Predict", key=_ml_key("predict_now"))
+    with c_save_model:
         save_clicked = st.button("Save Current Trained Model", key=_ml_key("save_model_now"))
-    train_save_clicked = False
+    with c_save_pred:
+        save_predictions_clicked = st.button("Save Predictions", key=_ml_key("save_predictions_now"))
     with c_status:
         st.caption(
-            "By default this page loads the last saved model bundle from `ml_saved_models/`. "
+            "By default this page displays the last saved prediction bundle from `ml_saved_predictions/`. "
+            "Click **Predict** only when you want to score the latest live sheet with the saved/trained model. "
             "Click **Train / Re-train Model Now** only when you want to rebuild the model. "
-            "Click **Save Current Trained Model** only after training/loading a model; it saves/uploads the current bundle and does not retrain."
+            "Model Save and Prediction Save do not retrain."
         )
         st.caption(_ml_github_config_label())
+        if has_existing_predictions:
+            st.caption("Saved predictions: " + _ml_prediction_bundle_summary(existing_prediction_session if isinstance(existing_prediction_session, dict) else existing_prediction_bundle))
+        elif existing_prediction_msg:
+            st.caption(existing_prediction_msg)
 
-    # IMPORTANT: handle Save before building features/training.
-    # Streamlit reruns the script on every button click; without this early branch,
-    # clicking Save would still rebuild the feature set and feel like training again.
+    threshold_mode = st.selectbox(
+        "Prediction threshold mode",
+        ["Balanced", "High Recall", "High Precision"],
+        index=0,
+        help="Applies only when you click Predict or Train. Saved predictions display exactly as they were last saved.",
+        key=_ml_key("ml_threshold_mode"),
+    )
+
+    # Save model without feature-building or training. Streamlit reruns on every
+    # button click, so this branch must stay before any ML build.
     if save_clicked:
-        _update_ml_progress(5, "Saving existing trained model bundle. No feature build or retraining will run on this click...")
+        _update_ml_progress(5, "Saving existing trained model bundle. No prediction build or retraining will run on this click...")
         session_bundle = st.session_state.get(session_bundle_key)
         saved_bundle, saved_msg = _ml_load_model_bundle(target_program)
         bundle_to_save = session_bundle if isinstance(session_bundle, dict) and session_bundle.get("model") is not None else saved_bundle
@@ -11636,17 +12057,35 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
             st.error("No trained model is available to save. Click **Train / Re-train Model Now** first, wait for training to finish, then click **Save Current Trained Model**.")
             st.stop()
         ok, msg = _ml_save_model_bundle(target_program, bundle_to_save)
-        _update_ml_progress(100, "Save action completed." if ok else "Save action failed. See message below.")
+        _update_ml_progress(100, "Model save action completed." if ok else "Model save action failed. See message below.")
         if ok:
             st.success(msg)
-            st.info("Save completed without rebuilding features or retraining. The app stopped this run intentionally after saving.")
+            st.info("Model save completed without rebuilding features, predicting, or retraining. The app stopped this run intentionally after saving.")
         else:
             st.error(msg)
             st.warning("If GitHub upload failed, check: token has Contents: Read/Write, repo/branch names are correct, and the token has access to this repository.")
         st.stop()
 
-    if not has_existing_model and not train_clicked:
-        st.info("No saved model is currently loaded for this page. Click **Train / Re-train Model Now** to build a model. After training finishes, click **Save Current Trained Model** to save/upload the currently trained bundle.")
+    # Save prediction data without feature-building or scoring. This saves the
+    # currently displayed/session prediction bundle, or the last saved bundle.
+    if save_predictions_clicked:
+        _update_ml_progress(5, "Saving current prediction bundle. No prediction build or retraining will run on this click...")
+        session_prediction = st.session_state.get(prediction_bundle_key)
+        saved_prediction, saved_pred_msg = _ml_load_prediction_bundle(target_program)
+        bundle_to_save = session_prediction if isinstance(session_prediction, dict) and isinstance(session_prediction.get("scored_df"), pd.DataFrame) and not session_prediction.get("scored_df").empty else saved_prediction
+        if not isinstance(bundle_to_save, dict) or not isinstance(bundle_to_save.get("scored_df"), pd.DataFrame) or bundle_to_save.get("scored_df").empty:
+            _update_ml_progress(100, "No prediction bundle found to save.")
+            st.error("No prediction data is available to save. Click **Predict** first to score live unpaid students, or load existing saved predictions.")
+            st.stop()
+        ok, msg = _ml_save_prediction_bundle(target_program, bundle_to_save)
+        _update_ml_progress(100, "Prediction save action completed." if ok else "Prediction save action failed. See message below.")
+        if ok:
+            st.success(msg)
+            st.info("Prediction save completed without rebuilding features, predicting, or retraining. The app stopped this run intentionally after saving.")
+        else:
+            st.error(msg)
+            st.warning("If GitHub upload failed, check token Contents: Read/Write, repo/branch names, and repository access.")
+        st.stop()
 
     feature_df = pd.DataFrame()
     train_df = pd.DataFrame()
@@ -11659,23 +12098,23 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
     importance_df = pd.DataFrame()
     error_audit_df = pd.DataFrame()
     program_perf_df = pd.DataFrame()
+    scored_df = pd.DataFrame()
+    active_prediction_bundle = None
     err = ""
 
     try:
-        _update_ml_progress(1, "Building current feature set and event intelligence...")
-        ml_dataset_result = build_ml_prediction_dataset(data, progress_callback=_update_ml_progress, program_filter=target_program)
-        if isinstance(ml_dataset_result, tuple) and len(ml_dataset_result) == 5:
-            feature_df, train_df, event_intel_df, group_intel_df, event_rows_df = ml_dataset_result
-        else:
-            # Backward-safe fallback for older cached/function variants.
-            feature_df, train_df, event_intel_df, group_intel_df = ml_dataset_result
-            event_rows_df = pd.DataFrame()
-
-        saved_bundle, saved_msg = _ml_load_model_bundle(target_program)
         session_bundle = st.session_state.get(session_bundle_key)
+        saved_bundle, saved_msg = _ml_load_model_bundle(target_program)
         active_bundle = session_bundle if isinstance(session_bundle, dict) and session_bundle.get("model") is not None else saved_bundle
 
         if train_clicked:
+            _update_ml_progress(1, "Training requested. Building fresh ML feature set from current Google Sheet data...")
+            ml_dataset_result = build_ml_prediction_dataset(data, progress_callback=_update_ml_progress, program_filter=target_program)
+            if isinstance(ml_dataset_result, tuple) and len(ml_dataset_result) == 5:
+                feature_df, train_df, event_intel_df, group_intel_df, event_rows_df = ml_dataset_result
+            else:
+                feature_df, train_df, event_intel_df, group_intel_df = ml_dataset_result
+                event_rows_df = pd.DataFrame()
             _update_ml_progress(62, "Training requested. Running stratified train/test models with class/sample weighting...")
             model, perf_df, confusion_df, importance_df, error_audit_df, err = train_ml_payment_models(train_df, preferred_model="Gradient Boosting", progress_callback=_update_ml_progress, progress_start=62, progress_end=88)
             program_perf_df = _ml_program_model_summary(train_df, progress_callback=_update_ml_progress, progress_start=89, progress_end=94)
@@ -11694,40 +12133,81 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                     "program_filter": target_program or "ALL",
                 }
                 st.session_state[session_bundle_key] = active_bundle
-                st.success("Model trained and stored in this session. Click **Save Current Trained Model** to write this exact trained bundle to the repo folder/GitHub. Save will not retrain.")
-        elif active_bundle:
-            model = active_bundle.get("model")
-            perf_df = active_bundle.get("perf_df", pd.DataFrame())
-            confusion_df = active_bundle.get("confusion_df", pd.DataFrame())
-            importance_df = active_bundle.get("importance_df", pd.DataFrame())
-            error_audit_df = active_bundle.get("error_audit_df", pd.DataFrame())
-            program_perf_df = active_bundle.get("program_perf_df", pd.DataFrame())
-            st.info("Using saved/trained model bundle: " + _ml_model_bundle_summary(active_bundle))
-            _update_ml_progress(94, "Loaded saved model bundle. Skipping training for faster dashboard load.")
+                _update_ml_progress(95, "Training complete. Scoring current live features with the newly trained model...")
+                scored_df = score_ml_students(model, feature_df, threshold_mode=threshold_mode)
+                prediction_bundle = _ml_make_prediction_bundle(target_program, scored_df, feature_df, train_df, event_intel_df, group_intel_df, event_rows_df, perf_df, confusion_df, importance_df, error_audit_df, program_perf_df, threshold_mode, model=model)
+                active_prediction_bundle = prediction_bundle
+                st.session_state[prediction_bundle_key] = prediction_bundle
+                st.success("Model trained and current predictions generated in this session. Click **Save Current Trained Model** to save the model and **Save Predictions** to save the scored output.")
+
+        elif predict_clicked:
+            if not isinstance(active_bundle, dict) or active_bundle.get("model") is None:
+                err = saved_msg + ". Click **Train / Re-train Model Now** to build a model, or add a valid saved model under `ml_saved_models/`."
+                _update_ml_progress(100, "No saved/trained model available for prediction.")
+            else:
+                model = active_bundle.get("model")
+                perf_df = active_bundle.get("perf_df", pd.DataFrame())
+                confusion_df = active_bundle.get("confusion_df", pd.DataFrame())
+                importance_df = active_bundle.get("importance_df", pd.DataFrame())
+                error_audit_df = active_bundle.get("error_audit_df", pd.DataFrame())
+                program_perf_df = active_bundle.get("program_perf_df", pd.DataFrame())
+                _update_ml_progress(1, "Predict requested. Building cached/current live features for scoring only; no training is running...")
+                ml_dataset_result = build_ml_prediction_dataset_cached(data, target_program)
+                if isinstance(ml_dataset_result, tuple) and len(ml_dataset_result) == 5:
+                    feature_df, train_df, event_intel_df, group_intel_df, event_rows_df = ml_dataset_result
+                else:
+                    feature_df, train_df, event_intel_df, group_intel_df = ml_dataset_result
+                    event_rows_df = pd.DataFrame()
+                _update_ml_progress(94, "Saved model loaded. Scoring live students now; training skipped.")
+                scored_df = score_ml_students(model, feature_df, threshold_mode=threshold_mode)
+                prediction_bundle = _ml_make_prediction_bundle(target_program, scored_df, feature_df, train_df, event_intel_df, group_intel_df, event_rows_df, perf_df, confusion_df, importance_df, error_audit_df, program_perf_df, threshold_mode, model=model)
+                active_prediction_bundle = prediction_bundle
+                st.session_state[prediction_bundle_key] = prediction_bundle
+                st.success("New live predictions generated. Click **Save Predictions** to persist this scored output to GitHub/local storage.")
+
         else:
-            err = saved_msg + ". Click **Train / Re-train Model Now** to build a model for this page, then click **Save Current Trained Model** if you want to persist it."
-            _update_ml_progress(94, "No saved model loaded. Waiting for manual training.")
+            # Default page open: do not build features and do not train. Display the
+            # last saved prediction bundle only.
+            session_prediction = st.session_state.get(prediction_bundle_key)
+            saved_prediction, saved_pred_msg = _ml_load_prediction_bundle(target_program)
+            prediction_bundle = session_prediction if isinstance(session_prediction, dict) and isinstance(session_prediction.get("scored_df"), pd.DataFrame) and not session_prediction.get("scored_df").empty else saved_prediction
+            if isinstance(prediction_bundle, dict) and isinstance(prediction_bundle.get("scored_df"), pd.DataFrame) and not prediction_bundle.get("scored_df").empty:
+                active_prediction_bundle = prediction_bundle
+                restored = _ml_restore_prediction_bundle(prediction_bundle)
+                scored_df = restored["scored_df"]
+                feature_df = restored["feature_df"]
+                train_df = restored["train_df"]
+                event_intel_df = restored["event_intel_df"]
+                group_intel_df = restored["group_intel_df"]
+                event_rows_df = restored["event_rows_df"]
+                perf_df = restored["perf_df"]
+                confusion_df = restored["confusion_df"]
+                importance_df = restored["importance_df"]
+                error_audit_df = restored["error_audit_df"]
+                program_perf_df = restored["program_perf_df"]
+                # Load model only for metadata/threshold caption when available; no scoring.
+                if isinstance(active_bundle, dict) and active_bundle.get("model") is not None:
+                    model = active_bundle.get("model")
+                _update_ml_progress(100, "Loaded last saved predictions. No live prediction build or training ran on this reload.")
+                st.info("Displaying last saved predictions: " + _ml_prediction_bundle_summary(prediction_bundle))
+            else:
+                _update_ml_progress(100, "No saved predictions available. Waiting for Predict or Train; no ML build/training is running.")
+                st.info("No saved prediction data is currently available for this page. Click **Predict** to score live unpaid students using the saved model, or click **Train / Re-train Model Now** to rebuild the model and generate predictions.")
+                if not has_existing_model:
+                    st.warning(existing_saved_msg)
+                st.warning(saved_pred_msg)
+                st.stop()
+
     except Exception as e:
-        _update_ml_progress(100, "ML build failed. See error below.")
-        st.error(f"ML prediction build failed: {e}")
+        _update_ml_progress(100, "ML action failed. See error below.")
+        st.error(f"ML prediction action failed: {e}")
         return
 
-    if feature_df.empty:
-        st.warning("No student feature rows could be built from the current data.")
+    if feature_df.empty and scored_df.empty:
+        st.warning("No prediction rows are available to display. Click **Predict** or **Train / Re-train Model Now**.")
         return
     if err:
         st.warning(err)
-
-    threshold_mode = st.selectbox(
-        "Prediction threshold mode",
-        ["Balanced", "High Recall", "High Precision"],
-        index=0,
-        help="Balanced uses a business-safe threshold floor to avoid over-broad high-intent lists. High Recall catches more possible converters. High Precision reduces false positives.",
-        key=_ml_key("ml_threshold_mode"),
-    )
-    _update_ml_progress(96, "Scoring all students using journey-window features...")
-    scored_df = score_ml_students(model, feature_df, threshold_mode=threshold_mode) if model is not None else pd.DataFrame()
-    _update_ml_progress(100, "ML prediction dashboard ready.")
 
     included = int(train_df.shape[0]) if train_df is not None else 0
     paid_rows = int(train_df["Actual Paid"].sum()) if train_df is not None and not train_df.empty else 0
@@ -11737,9 +12217,20 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         pred_source["Prediction Band"] = "Not scored"
         pred_source["Payment Probability %"] = np.nan
 
-    primary_name = getattr(model, "ml_model_name_", "Gradient Boosting") if model is not None else "Not trained"
-    primary_threshold = float(getattr(model, "ml_base_threshold_", getattr(model, "ml_threshold_", 0.50))) if model is not None else 0.50
-    active_threshold = _ml_threshold_for_mode(primary_threshold, threshold_mode) if model is not None else 0.50
+    has_scored_predictions = not scored_df.empty and "Payment Probability" in scored_df.columns
+    primary_name = getattr(model, "ml_model_name_", "") if model is not None else ""
+    if not primary_name and isinstance(active_prediction_bundle, dict):
+        primary_name = clean_text(active_prediction_bundle.get("model_name", ""))
+    primary_name = primary_name or ("Saved predictions" if has_scored_predictions else "Not trained")
+    if model is not None:
+        primary_threshold = float(getattr(model, "ml_base_threshold_", getattr(model, "ml_threshold_", 0.50)))
+        active_threshold = _ml_threshold_for_mode(primary_threshold, threshold_mode)
+    elif has_scored_predictions and "Model Threshold" in scored_df.columns:
+        primary_threshold = float(pd.to_numeric(scored_df["Model Threshold"], errors="coerce").dropna().iloc[0]) if not pd.to_numeric(scored_df["Model Threshold"], errors="coerce").dropna().empty else 0.50
+        active_threshold = primary_threshold
+    else:
+        primary_threshold = 0.50
+        active_threshold = 0.50
 
     available_unpaid_df = feature_df[feature_df.get("Actual Paid", pd.Series(0, index=feature_df.index)).astype(int).eq(0)].copy() if not feature_df.empty else pd.DataFrame()
     unpaid_df = scored_df[scored_df.get("Actual Paid", pd.Series(0, index=scored_df.index)).astype(int).eq(0)].copy() if not scored_df.empty else pd.DataFrame()
@@ -11750,17 +12241,17 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Students in Feature Set", f"{len(feature_df):,}")
     m2.metric("Training Rows", f"{included:,}", delta=f"{paid_rows:,} converted")
-    if model is not None:
+    if has_scored_predictions:
         m3.metric("Unpaid Scored", f"{len(unpaid_df):,}")
         m4.metric("High Intent Unpaid", f"{high_intent_unpaid:,}", delta=f"{likely_unpaid:,} likely to pay")
         m5.metric("Avg Unpaid Probability", f"{avg_unpaid_prob:.1f}%")
     else:
         m3.metric("Unpaid Available", f"{len(available_unpaid_df):,}")
-        m4.metric("High Intent Unpaid", "—", delta="train model first")
+        m4.metric("High Intent Unpaid", "—", delta="click Predict first")
         m5.metric("Avg Unpaid Probability", "—")
     st.caption(
-        f"Primary scoring model: {primary_name}. Statistical balanced threshold: {primary_threshold:.3f}; active business-safe {threshold_mode} threshold: {active_threshold:.3f}. "
-        "The selected model is evaluated with train/test split, then refit on all historical labelled rows before scoring current unpaid students."
+        f"Primary scoring model: {primary_name}. Threshold shown/used: {active_threshold:.3f}. "
+        "Saved predictions display instantly from the last saved prediction bundle. Click Predict only when you want to score the latest live sheet; click Train only when you want to rebuild the model."
     )
 
     with st.expander("How this ML prediction score is calculated", expanded=False):
@@ -11804,6 +12295,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
     tabs = st.tabs([
         "Unpaid Conversion Pipeline",
         "Post-Deadline Reactivation",
+        "Late Payment Patterns",
         "All Student Predictions",
         "Model Performance",
         "Event Group Intelligence",
@@ -11832,7 +12324,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
             cols = [c for c in [
                 "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Counsellor", "Community Acquired", "Current Status", "Status Reference Signal",
                 "Payment Probability %", "Base ML Probability %", "Historical Pattern Probability %", "Historical Segment Size", "Calibrated Base Probability %", "Positive Engagement Uplift %", "Positive Signal Floor %", "Prediction Band", "Predicted Conversion", "Model Threshold",
-                "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days",
+                "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days", "Late Payment Pattern", "late_payment_pattern_score", "reactivated_similar_to_late_payers",
                 "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
                 "Engagement Quality", "engagement_quality_score", "weighted_engagement_score", "meaningful_touchpoints", "four_plus_meaningful_participation", "longest_consecutive_participation", "max_7_event_window_participation", "one_miss_7_event_pattern", "six_plus_consecutive_participation", "compact_activity_gap_pattern", "regular_participation_signal", "participation_pattern_label", "avg_activity_gap_days", "median_activity_gap_days",
                 "high_impact_group_touchpoints", "high_impact_group_diversity", "has_high_impact_group", "high_impact_group_intensity",
@@ -11863,7 +12355,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
 
     with tabs[1]:
         st.markdown("#### Post-deadline reactivation signals")
-        st.caption("Shows students who became active after their deadline / 30-day journey. These late signals are shown separately and are not used inside the main payment prediction feature window.")
+        st.caption("Shows students who became active after their deadline / 30-day journey. Late signals are payment-safe: converted students are capped before payment, and Tetr-X post-payment events are excluded.")
         reactivation_base = scored_df.copy() if not scored_df.empty else feature_df.copy()
         if reactivation_base.empty or "reactivated_after_deadline" not in reactivation_base.columns:
             st.info("No reactivation features are available from the current dataset.")
@@ -11964,6 +12456,52 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                     st.dataframe(_display_react, use_container_width=True, height=560, hide_index=True, key=_ml_key("ml_reactivation_table"))
 
     with tabs[2]:
+        st.markdown("#### Paid-after-deadline pattern intelligence")
+        st.caption("Identifies historical students who paid after their deadline and the post-deadline activity patterns they showed before payment. Current unpaid reactivated students can be compared against these patterns. Event signals here use batch sheets only; Tetr-X post-payment activity is excluded.")
+        late_source = scored_df.copy() if not scored_df.empty else feature_df.copy()
+        paid_late_students_df, late_pattern_summary_df = build_ml_late_payment_pattern_intelligence(late_source)
+        l1, l2, l3, l4 = st.columns(4)
+        late_paid_count = int(len(paid_late_students_df)) if paid_late_students_df is not None else 0
+        if late_source is not None and not late_source.empty:
+            _late_like_series = pd.to_numeric(late_source.get("reactivated_similar_to_late_payers", pd.Series(dtype=float)), errors="coerce").fillna(0).astype(int)
+            _actual_paid_series = pd.to_numeric(late_source.get("Actual Paid", pd.Series(dtype=float)), errors="coerce").fillna(0).astype(int)
+            reactivated_like_count = int(_late_like_series.eq(1).sum())
+            unpaid_like_count = int((_late_like_series.eq(1) & _actual_paid_series.eq(0)).sum())
+        else:
+            reactivated_like_count = unpaid_like_count = 0
+        avg_days_late = pd.to_numeric(paid_late_students_df.get("days_deadline_to_payment", pd.Series(dtype=float)), errors="coerce").replace(999, np.nan).mean() if paid_late_students_df is not None and not paid_late_students_df.empty else np.nan
+        l1.metric("Paid After Deadline", f"{late_paid_count:,}")
+        l2.metric("Avg Days After Deadline", f"{avg_days_late:.1f}" if pd.notna(avg_days_late) else "—")
+        l3.metric("Students Matching Late Pattern", f"{reactivated_like_count:,}")
+        l4.metric("Unpaid Matching Late Pattern", f"{unpaid_like_count:,}")
+        if late_pattern_summary_df is not None and not late_pattern_summary_df.empty:
+            st.markdown("##### Late pattern conversion summary")
+            st.dataframe(late_pattern_summary_df, use_container_width=True, hide_index=True, key=_ml_key("ml_late_pattern_summary"))
+            chart_df = late_pattern_summary_df.copy()
+            fig = px.bar(chart_df, x="Late Pattern", y="Paid After Deadline", color="Conversion %", text="Paid After Deadline", title="Paid-after-deadline conversions by reactivation pattern")
+            st.plotly_chart(nice_layout(fig, height=420, x_tickangle=-20), use_container_width=True, key=_ml_key("ml_late_pattern_chart"))
+        else:
+            st.info("No paid-after-deadline pattern summary is available from the current prediction dataset.")
+        if paid_late_students_df is not None and not paid_late_students_df.empty:
+            st.markdown("##### Students who paid after deadline")
+            st.dataframe(_ml_safe_display_df(paid_late_students_df.head(300)), use_container_width=True, hide_index=True, height=520, key=_ml_key("ml_paid_after_deadline_students"))
+        else:
+            st.info("No students with payment date after deadline were identified in this program.")
+        if late_source is not None and not late_source.empty:
+            late_unpaid = late_source[
+                pd.to_numeric(late_source.get("Actual Paid", 0), errors="coerce").fillna(0).astype(int).eq(0)
+                & pd.to_numeric(late_source.get("reactivated_similar_to_late_payers", 0), errors="coerce").fillna(0).astype(int).eq(1)
+            ].copy()
+            if not late_unpaid.empty:
+                st.markdown("##### Unpaid students resembling late payers")
+                cols = [c for c in ["Name", "Email", "Program", "Batch", "Course", "Current Status", "Payment Probability %", "Prediction Band", "Predicted Conversion", "Late Payment Pattern", "late_payment_pattern_score", "post_deadline_touchpoints", "post_deadline_meaningful_touchpoints", "reactivation_gap_days", "Why This Probability", "Recommended Conversion Actions"] if c in late_unpaid.columns]
+                if "Payment Probability %" in late_unpaid.columns:
+                    late_unpaid = late_unpaid.sort_values(["Payment Probability %", "late_payment_pattern_score"], ascending=[False, False])
+                else:
+                    late_unpaid = late_unpaid.sort_values("late_payment_pattern_score", ascending=False)
+                st.dataframe(_ml_safe_display_df(late_unpaid[cols]), use_container_width=True, hide_index=True, height=520, key=_ml_key("ml_unpaid_late_pattern_students"))
+
+    with tabs[3]:
         st.markdown("#### All student-level payment probabilities")
         if scored_df.empty:
             st.info("Student probability scoring is unavailable until a model is trained successfully.")
@@ -11992,7 +12530,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
             cols = [c for c in [
                 "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Community Acquired",
                 "Payment Probability %", "Base ML Probability %", "Historical Pattern Probability %", "Historical Segment Size", "Calibrated Base Probability %", "Positive Engagement Uplift %", "Positive Signal Floor %", "Prediction Band", "Predicted Conversion", "Threshold Mode", "Model Threshold", "Actual Paid",
-                "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days",
+                "total_touchpoints", "first30_touchpoints", "post_deadline_touchpoints", "reactivated_after_deadline", "reactivation_gap_days", "Late Payment Pattern", "late_payment_pattern_score", "reactivated_similar_to_late_payers",
                 "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count",
                 "Engagement Quality", "engagement_quality_score", "weighted_engagement_score", "meaningful_touchpoints", "four_plus_meaningful_participation", "longest_consecutive_participation", "max_7_event_window_participation", "one_miss_7_event_pattern", "six_plus_consecutive_participation", "compact_activity_gap_pattern", "regular_participation_signal", "participation_pattern_label", "avg_activity_gap_days", "median_activity_gap_days",
                 "high_impact_group_touchpoints", "high_impact_group_diversity", "has_high_impact_group", "high_impact_group_intensity",
@@ -12003,7 +12541,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                 display["Actual Paid"] = display["Actual Paid"].map(lambda x: "Yes" if int(x) == 1 else "No")
             st.dataframe(display, use_container_width=True, height=560, hide_index=True, key=_ml_key("ml_student_predictions_table"))
 
-    with tabs[3]:
+    with tabs[4]:
         st.markdown("#### Train/test model performance")
         st.caption("Models are trained on historical conversion outcomes using stratified train/test split. Class/sample weights handle paid/unpaid imbalance. PR AUC is included because it is more useful than accuracy when paid rows are the minority. The selected model is then refit on all labelled data before live unpaid scoring.")
         if perf_df is not None and not perf_df.empty:
@@ -12023,7 +12561,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         else:
             st.info("Program-level model performance is unavailable.")
 
-    with tabs[4]:
+    with tabs[5]:
         st.markdown("#### Repetitive event-group conversion intelligence")
         st.caption("Groups combine repeated sessions across batches using speaker/topic/challenge keywords. 7-day and 10-day payment columns show conversions that happened soon after attendance; these same journey-window group features are included in the ML model.")
         min_att = st.slider("Minimum attended students", 1, 100, 10, key=_ml_key("ml_group_min_attended"))
@@ -12068,7 +12606,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         if health_rows:
             st.dataframe(pd.DataFrame(health_rows), use_container_width=True, hide_index=True, key=_ml_key("ml_feature_signal_health"))
 
-    with tabs[5]:
+    with tabs[6]:
         st.markdown("#### Batch event-pattern intelligence")
         st.caption("Shows which batch-level participation patterns are historically connected with conversion. This section uses batch labels for analysis only; Batch is removed from model feature selection.")
         batch_pattern_df, batch_group_pattern_df = build_ml_batch_pattern_intelligence(train_df, event_rows_df)
@@ -12089,9 +12627,9 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         else:
             st.info("No batch event-group pattern rows are available.")
 
-    with tabs[6]:
+    with tabs[7]:
         st.markdown("#### Event-level conversion intelligence")
-        st.caption("Specific event rows inside the journey-safe observation window. Payments within 7 and 10 days after event attendance are shown to identify events most closely connected to conversion.")
+        st.caption("Specific batch-sheet event rows inside the journey-safe/payment-safe observation window. Tetr-X post-payment activity is excluded. Payments within 7 and 10 days after event attendance are shown to identify events most closely connected to conversion.")
         min_att_event = st.slider("Minimum event attendees", 1, 100, 10, key=_ml_key("ml_event_min_attended"))
         edf = event_intel_df[event_intel_df["Attended Students"].ge(min_att_event)].copy() if event_intel_df is not None and not event_intel_df.empty else pd.DataFrame()
         if not edf.empty:
@@ -12103,7 +12641,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         else:
             st.info("No event rows meet the selected attendance threshold.")
 
-    with tabs[7]:
+    with tabs[8]:
         st.markdown("#### Model factor importance")
         if importance_df is not None and not importance_df.empty:
             st.dataframe(importance_df, use_container_width=True, hide_index=True, key=_ml_key("ml_feature_importance_table"))
@@ -12114,7 +12652,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         else:
             st.info("Feature importance is unavailable for the selected model.")
 
-    with tabs[8]:
+    with tabs[9]:
         st.markdown("#### False positive / false negative audit")
         st.caption("Held-out test rows where model prediction differed from actual conversion label.")
         if error_audit_df is not None and not error_audit_df.empty:
@@ -12131,13 +12669,13 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         else:
             st.info("No held-out prediction errors available, or model training did not complete.")
 
-    with tabs[9]:
+    with tabs[10]:
         st.markdown("#### Training feature dataset audit")
-        st.caption("Refund rows are included as converted. Model features use offer-to-deadline behavior plus payment-safe late-intent/reactivation signals. Converted rows are capped before payment. Eligibility ratios are removed; participation patterns are shown instead.")
+        st.caption("Refund rows are included as converted. Model features use batch-sheet pre-payment behavior plus payment-safe late-intent/reactivation signals; Tetr-X post-payment events are excluded. Converted rows are capped before payment using payment dates. Eligibility ratios are removed; participation patterns are shown instead.")
         audit_cols = [c for c in [
             "Name", "Email", "Program", "Batch", "Course", "Country", "Region", "Income", "Counsellor", "Community Acquired",
-            "Actual Paid", "Refund / Later Refunded", "training_included", "Offered Date", "Deadline", "Payment Date", "Observation Scope", "Observation Cutoff",
-            "total_touchpoints", "first30_touchpoints", "first30_active_days", "post_deadline_touchpoints", "post_deadline_active_days", "reactivated_after_deadline", "reactivation_gap_days", "post_deadline_meaningful_touchpoints", "active_after_deadline_only", "reactivation_quality_signal",
+            "Actual Paid", "Refund / Later Refunded", "paid_after_deadline", "days_deadline_to_payment", "training_included", "Offered Date", "Deadline", "Payment Date", "Observation Scope", "Observation Cutoff",
+            "total_touchpoints", "first30_touchpoints", "first30_active_days", "post_deadline_touchpoints", "post_deadline_active_days", "reactivated_after_deadline", "reactivation_gap_days", "post_deadline_meaningful_touchpoints", "Late Payment Pattern", "late_payment_pattern_score", "reactivated_similar_to_late_payers", "active_after_deadline_only", "reactivation_quality_signal",
             "active_days", "observation_days", "touchpoints_per_observed_day", "online_masterclass_count", "competition_count", "general_fun_count", "winner_spotlight_count", "meaningful_touchpoints", "general_only",
             "Engagement Quality", "engagement_quality_score", "weighted_engagement_score", "safe_weighted_engagement_score_including_late", "meaningful_touchpoints",
             "batch_journey_events", "batch_journey_attended_events", "batch_journey_meaningful_attended", "batch_journey_high_impact_attended", "longest_consecutive_participation", "max_7_event_window_participation", "one_miss_7_event_pattern", "six_plus_consecutive_participation", "four_plus_meaningful_participation", "compact_activity_gap_pattern", "regular_participation_signal", "participation_pattern_label", "avg_activity_gap_days", "median_activity_gap_days", "post_deadline_longest_consecutive_participation", "post_deadline_one_miss_7_event_pattern", "post_deadline_compact_activity_gap_pattern", "post_deadline_regular_participation_signal", "high_impact_group_touchpoints", "high_impact_group_diversity", "has_high_impact_group", "high_impact_group_intensity",
