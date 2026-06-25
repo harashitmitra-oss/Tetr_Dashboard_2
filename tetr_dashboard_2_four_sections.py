@@ -11535,19 +11535,25 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         progress_status.markdown(f"**{pct}%** · {clean_text(message)}")
 
     st.markdown("#### Model training controls")
-    c_train, c_save, c_status = st.columns([1.1, 1.1, 2.8])
+    session_bundle_key = _ml_key("active_model_bundle")
+    existing_session_bundle = st.session_state.get(session_bundle_key)
+    existing_saved_bundle, existing_saved_msg = _ml_load_model_bundle(target_program)
+    has_existing_model = (isinstance(existing_session_bundle, dict) and existing_session_bundle.get("model") is not None) or (isinstance(existing_saved_bundle, dict) and existing_saved_bundle.get("model") is not None)
+
+    c_train, c_train_save, c_save, c_status = st.columns([1.05, 1.2, 1.1, 2.65])
     with c_train:
         train_clicked = st.button("Train / Re-train Model Now", type="primary", key=_ml_key("train_model_now"))
+    with c_train_save:
+        train_save_clicked = st.button("Train + Save to GitHub", key=_ml_key("train_save_model_now"))
     with c_save:
-        save_clicked = st.button("Save Current Trained Model", key=_ml_key("save_model_now"))
+        save_clicked = st.button("Save Current Trained Model", key=_ml_key("save_model_now"), disabled=not has_existing_model)
     with c_status:
         st.caption(
             "By default this page loads the last saved model bundle from `ml_saved_models/`. "
-            "Training runs only when you click the train button. Save uses the already-trained bundle from this session or the existing saved bundle; it does not retrain."
+            "Training runs only when you click Train. **Save Current** only uploads an already-trained/saved bundle and does not retrain. "
+            "Use **Train + Save to GitHub** when there is no saved model yet."
         )
         st.caption(_ml_github_config_label())
-
-    session_bundle_key = _ml_key("active_model_bundle")
 
     # IMPORTANT: handle Save before building features/training.
     # Streamlit reruns the script on every button click; without this early branch,
@@ -11559,7 +11565,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         bundle_to_save = session_bundle if isinstance(session_bundle, dict) and session_bundle.get("model") is not None else saved_bundle
         if not isinstance(bundle_to_save, dict) or bundle_to_save.get("model") is None:
             _update_ml_progress(100, "No trained or saved model bundle found to save.")
-            st.error("No trained model is available to save. Click **Train / Re-train Model Now** first, or add a valid saved `.joblib` model under `ml_saved_models/`.")
+            st.error("No trained model is available to save. Click **Train + Save to GitHub** or **Train / Re-train Model Now** first.")
             st.stop()
         ok, msg = _ml_save_model_bundle(target_program, bundle_to_save)
         _update_ml_progress(100, "Save action completed." if ok else "Save action failed. See message below.")
@@ -11570,6 +11576,9 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
             st.error(msg)
             st.warning("If GitHub upload failed, check: token has Contents: Read/Write, repo/branch names are correct, and the token has access to this repository.")
         st.stop()
+
+    if not has_existing_model and not train_clicked and not train_save_clicked:
+        st.info("No saved model is currently loaded for this page. Click **Train + Save to GitHub** once to train the model and commit the `.joblib` bundle, or click **Train / Re-train Model Now** to train without saving.")
 
     feature_df = pd.DataFrame()
     train_df = pd.DataFrame()
@@ -11598,7 +11607,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         session_bundle = st.session_state.get(session_bundle_key)
         active_bundle = session_bundle if isinstance(session_bundle, dict) and session_bundle.get("model") is not None else saved_bundle
 
-        if train_clicked:
+        if train_clicked or train_save_clicked:
             _update_ml_progress(62, "Training requested. Running stratified train/test models with class/sample weighting...")
             model, perf_df, confusion_df, importance_df, error_audit_df, err = train_ml_payment_models(train_df, preferred_model="Gradient Boosting", progress_callback=_update_ml_progress, progress_start=62, progress_end=88)
             program_perf_df = _ml_program_model_summary(train_df, progress_callback=_update_ml_progress, progress_start=89, progress_end=94)
@@ -11617,7 +11626,16 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                     "program_filter": target_program or "ALL",
                 }
                 st.session_state[session_bundle_key] = active_bundle
-                st.success("Model trained. Click **Save Current Trained Model** to write this trained bundle to the repo model folder.")
+                if train_save_clicked:
+                    _update_ml_progress(95, "Training completed. Saving trained model bundle locally and to GitHub...")
+                    ok, msg = _ml_save_model_bundle(target_program, active_bundle)
+                    if ok:
+                        st.success("Model trained and saved successfully. " + msg)
+                    else:
+                        st.error("Model trained, but save failed. " + msg)
+                        st.warning("Check GitHub token access, Contents: Read/Write permission, repo name, branch, and whether the token can access this repository.")
+                else:
+                    st.success("Model trained. Click **Save Current Trained Model** to write this trained bundle to the repo model folder/GitHub.")
         elif active_bundle:
             model = active_bundle.get("model")
             perf_df = active_bundle.get("perf_df", pd.DataFrame())
