@@ -11637,6 +11637,42 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         if reactivation_base.empty or "reactivated_after_deadline" not in reactivation_base.columns:
             st.info("No reactivation features are available from the current dataset.")
         else:
+            # Reactivation can be shown even before a model is trained or when a saved
+            # model bundle is not available yet. In that case reactivation_base comes
+            # from feature_df, which may not contain prediction/display columns. Keep
+            # this tab defensive so missing model-score columns never crash the page.
+            _react_defaults = {
+                "student_id": "",
+                "Payment Probability %": np.nan,
+                "Payment Probability": np.nan,
+                "Prediction Band": "Not scored",
+                "Predicted Conversion": "Not scored",
+                "Base ML Probability %": np.nan,
+                "Historical Pattern Probability %": np.nan,
+                "Historical Segment Size": 0,
+                "Calibrated Base Probability %": np.nan,
+                "Positive Engagement Uplift %": 0.0,
+                "Positive Signal Floor %": 0.0,
+                "reactivation_gap_days": np.nan,
+                "post_deadline_touchpoints": 0,
+                "post_deadline_meaningful_touchpoints": 0,
+                "post_deadline_online_masterclass_count": 0,
+                "post_deadline_competition_count": 0,
+                "post_deadline_general_fun_count": 0,
+                "Why This Probability": "Train or load a saved model to show probability reasons.",
+                "Recommended Conversion Actions": "Train or load a saved model to show recommended actions.",
+            }
+            for _col, _default in _react_defaults.items():
+                if _col not in reactivation_base.columns:
+                    reactivation_base[_col] = _default
+            if reactivation_base["student_id"].astype(str).str.strip().eq("").all():
+                if "Email" in reactivation_base.columns:
+                    reactivation_base["student_id"] = reactivation_base["Email"].astype(str)
+                elif "Name" in reactivation_base.columns:
+                    reactivation_base["student_id"] = reactivation_base["Name"].astype(str)
+                else:
+                    reactivation_base["student_id"] = reactivation_base.index.astype(str)
+
             react_df = reactivation_base[pd.to_numeric(reactivation_base.get("reactivated_after_deadline", 0), errors="coerce").fillna(0).astype(int).eq(1)].copy()
             unpaid_react_df = react_df[pd.to_numeric(react_df.get("Actual Paid", 0), errors="coerce").fillna(0).astype(int).eq(0)].copy() if not react_df.empty else pd.DataFrame()
             rc1, rc2, rc3, rc4 = st.columns(4)
@@ -11660,12 +11696,22 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                     show_react = show_react[pd.to_numeric(show_react.get("Actual Paid", 0), errors="coerce").fillna(0).astype(int).eq(0)].copy()
                 if program_filter and "Program" in show_react.columns:
                     show_react = show_react[show_react["Program"].astype(str).isin(program_filter)]
-                summary = show_react.groupby("Program", as_index=False).agg(
-                    Students=("student_id", "nunique"),
-                    Avg_Probability=("Payment Probability %", "mean"),
-                    Avg_Reactivation_Gap=("reactivation_gap_days", lambda s: pd.to_numeric(s, errors="coerce").replace(999, np.nan).mean()),
-                    Avg_Post_Deadline_Touchpoints=("post_deadline_touchpoints", "mean"),
-                ) if not show_react.empty and "Program" in show_react.columns else pd.DataFrame()
+                if not show_react.empty and "Program" in show_react.columns:
+                    _agg = {}
+                    if "student_id" in show_react.columns:
+                        _agg["Students"] = ("student_id", "nunique")
+                    else:
+                        show_react["_row_student_id"] = show_react.index.astype(str)
+                        _agg["Students"] = ("_row_student_id", "nunique")
+                    if "Payment Probability %" in show_react.columns:
+                        _agg["Avg_Probability"] = ("Payment Probability %", "mean")
+                    if "reactivation_gap_days" in show_react.columns:
+                        _agg["Avg_Reactivation_Gap"] = ("reactivation_gap_days", lambda s: pd.to_numeric(s, errors="coerce").replace(999, np.nan).mean())
+                    if "post_deadline_touchpoints" in show_react.columns:
+                        _agg["Avg_Post_Deadline_Touchpoints"] = ("post_deadline_touchpoints", "mean")
+                    summary = show_react.groupby("Program", as_index=False).agg(**_agg) if _agg else pd.DataFrame()
+                else:
+                    summary = pd.DataFrame()
                 if not summary.empty:
                     summary["Avg_Probability"] = summary["Avg_Probability"].round(1)
                     summary["Avg_Reactivation_Gap"] = summary["Avg_Reactivation_Gap"].round(1)
@@ -11681,7 +11727,10 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                     "Offered Date", "Deadline", "Observation Scope"
                 ] if c in show_react.columns]
                 if cols:
-                    st.dataframe(show_react[cols].sort_values(["Payment Probability %", "post_deadline_touchpoints"], ascending=[False, False]), use_container_width=True, height=560, hide_index=True, key=_ml_key("ml_reactivation_table"))
+                    _sort_cols = [c for c in ["Payment Probability %", "post_deadline_touchpoints"] if c in show_react.columns]
+                    _sort_asc = [False] * len(_sort_cols)
+                    _display_react = show_react[cols].sort_values(_sort_cols, ascending=_sort_asc) if _sort_cols else show_react[cols]
+                    st.dataframe(_display_react, use_container_width=True, height=560, hide_index=True, key=_ml_key("ml_reactivation_table"))
 
     with tabs[2]:
         st.markdown("#### All student-level payment probabilities")
