@@ -106,6 +106,13 @@ def _ml_get_github_model_config():
     return {"token": token, "owner": owner, "repo": repo, "branch": branch or "main"}
 
 
+def _ml_github_config_label() -> str:
+    cfg = _ml_get_github_model_config()
+    if not cfg:
+        return "GitHub model upload: not configured. Save will only write local/repo-folder files."
+    return f"GitHub model upload: configured for {cfg['owner']}/{cfg['repo']} · branch {cfg['branch']}"
+
+
 def _ml_push_file_to_github(local_path: Path, repo_path: str) -> tuple[bool, str]:
     """Create/update a saved model file in GitHub via the Contents API.
 
@@ -200,9 +207,14 @@ def _ml_save_model_bundle(program_filter: str, bundle: dict) -> tuple[bool, str]
             repo_path = path.relative_to(repo_root).as_posix()
         except Exception:
             repo_path = f"ml_saved_models/{path.name}"
+        cfg = _ml_get_github_model_config()
         gh_ok, gh_msg = _ml_push_file_to_github(path, repo_path)
         if gh_ok:
             return True, f"Saved trained model bundle locally to {path} and pushed to GitHub. {gh_msg}"
+        if cfg:
+            # GitHub was configured, so surface this as a real save failure instead of
+            # silently saying local-only. This makes token/repo/branch permission issues visible.
+            return False, f"Saved locally to {path}, but GitHub upload failed. {gh_msg}"
         return True, f"Saved trained model bundle locally to {path}. {gh_msg}"
     except Exception as e:
         return False, f"Could not save trained model: {e}"
@@ -11531,8 +11543,33 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
     with c_status:
         st.caption(
             "By default this page loads the last saved model bundle from `ml_saved_models/`. "
-            "Training runs only when you click the train button. Save writes a reusable `.joblib` bundle inside the app repo path and pushes it to GitHub when GitHub secrets are configured."
+            "Training runs only when you click the train button. Save uses the already-trained bundle from this session or the existing saved bundle; it does not retrain."
         )
+        st.caption(_ml_github_config_label())
+
+    session_bundle_key = _ml_key("active_model_bundle")
+
+    # IMPORTANT: handle Save before building features/training.
+    # Streamlit reruns the script on every button click; without this early branch,
+    # clicking Save would still rebuild the feature set and feel like training again.
+    if save_clicked:
+        _update_ml_progress(5, "Saving existing trained model bundle. No feature build or retraining will run on this click...")
+        session_bundle = st.session_state.get(session_bundle_key)
+        saved_bundle, saved_msg = _ml_load_model_bundle(target_program)
+        bundle_to_save = session_bundle if isinstance(session_bundle, dict) and session_bundle.get("model") is not None else saved_bundle
+        if not isinstance(bundle_to_save, dict) or bundle_to_save.get("model") is None:
+            _update_ml_progress(100, "No trained or saved model bundle found to save.")
+            st.error("No trained model is available to save. Click **Train / Re-train Model Now** first, or add a valid saved `.joblib` model under `ml_saved_models/`.")
+            st.stop()
+        ok, msg = _ml_save_model_bundle(target_program, bundle_to_save)
+        _update_ml_progress(100, "Save action completed." if ok else "Save action failed. See message below.")
+        if ok:
+            st.success(msg)
+            st.info("Save completed without rebuilding features or retraining. The app stopped this run intentionally after saving.")
+        else:
+            st.error(msg)
+            st.warning("If GitHub upload failed, check: token has Contents: Read/Write, repo/branch names are correct, and the token has access to this repository.")
+        st.stop()
 
     feature_df = pd.DataFrame()
     train_df = pd.DataFrame()
@@ -11547,8 +11584,6 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
     program_perf_df = pd.DataFrame()
     err = ""
 
-    session_bundle_key = _ml_key("active_model_bundle")
-
     try:
         _update_ml_progress(1, "Building current feature set and event intelligence...")
         ml_dataset_result = build_ml_prediction_dataset(data, progress_callback=_update_ml_progress, program_filter=target_program)
@@ -11562,16 +11597,6 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
         saved_bundle, saved_msg = _ml_load_model_bundle(target_program)
         session_bundle = st.session_state.get(session_bundle_key)
         active_bundle = session_bundle if isinstance(session_bundle, dict) and session_bundle.get("model") is not None else saved_bundle
-
-        if save_clicked:
-            bundle_to_save = session_bundle if isinstance(session_bundle, dict) and session_bundle.get("model") is not None else active_bundle
-            ok, msg = _ml_save_model_bundle(target_program, bundle_to_save or {})
-            if ok:
-                st.success(msg)
-                saved_bundle, saved_msg = _ml_load_model_bundle(target_program)
-                active_bundle = saved_bundle or bundle_to_save
-            else:
-                st.error(msg)
 
         if train_clicked:
             _update_ml_progress(62, "Training requested. Running stratified train/test models with class/sample weighting...")
