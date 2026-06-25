@@ -220,15 +220,81 @@ def _ml_save_model_bundle(program_filter: str, bundle: dict) -> tuple[bool, str]
         return False, f"Could not save trained model: {e}"
 
 
+def _ml_pull_model_file_from_github(program_filter: str, local_path: Path) -> tuple[bool, str]:
+    """Download a saved model bundle from GitHub into the local app runtime.
+
+    This lets Streamlit Cloud reuse a model that was pushed to GitHub even before
+    the app redeploys with that file physically present in the checkout.
+    """
+    cfg = _ml_get_github_model_config()
+    if not cfg:
+        return False, "GitHub model download is not configured."
+
+    owner, repo, branch, token = cfg["owner"], cfg["repo"], cfg["branch"], cfg["token"]
+    repo_path = f"ml_saved_models/{_ml_model_bundle_path(program_filter).name}"
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{repo_path}?ref={branch}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "tetr-ml-prediction-dashboard",
+    }
+    try:
+        req = urllib.request.Request(api_url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            meta = json.loads(resp.read().decode("utf-8"))
+
+        raw_bytes = b""
+        content = meta.get("content")
+        encoding = clean_text(meta.get("encoding", "")).lower() if "clean_text" in globals() else str(meta.get("encoding", "")).lower()
+        if content and encoding == "base64":
+            raw_bytes = base64.b64decode(str(content).replace("\n", ""))
+        else:
+            # For larger files GitHub may omit base64 content and provide a download URL.
+            download_url = meta.get("download_url")
+            if not download_url:
+                return False, f"GitHub model file was found but no downloadable content was returned for {repo_path}."
+            raw_req = urllib.request.Request(download_url, headers=headers, method="GET")
+            with urllib.request.urlopen(raw_req, timeout=90) as raw_resp:
+                raw_bytes = raw_resp.read()
+
+        if not raw_bytes:
+            return False, f"Downloaded GitHub model file is empty: {repo_path}"
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(raw_bytes)
+        return True, f"Downloaded saved model from GitHub: {repo_path}"
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False, f"No saved model found in GitHub at ml_saved_models/{_ml_model_bundle_path(program_filter).name}"
+        try:
+            detail = e.read().decode("utf-8")[:500]
+        except Exception:
+            detail = ""
+        return False, f"GitHub model download failed ({e.code}). {detail}"
+    except Exception as e:
+        return False, f"GitHub model download failed: {e}"
+
+
 def _ml_load_model_bundle(program_filter: str) -> tuple[dict | None, str]:
     try:
         path = _ml_model_bundle_path(program_filter)
+        source_notes = []
+
+        # First use the model already present in the repo/runtime. This is the
+        # fastest path and should be the default after the .joblib has been saved.
         if not path.exists():
-            return None, f"No saved model found at {path}"
+            pulled, pull_msg = _ml_pull_model_file_from_github(program_filter, path)
+            source_notes.append(pull_msg)
+            if not pulled and not path.exists():
+                return None, f"No saved model found at {path}. {pull_msg}"
+
         bundle = joblib.load(path)
         if not isinstance(bundle, dict) or bundle.get("model") is None:
             return None, f"Saved model file exists but is not a valid model bundle: {path}"
-        return bundle, f"Loaded saved model from {path}"
+        note = f"Loaded saved model from {path}"
+        if source_notes:
+            note += " · " + " · ".join([m for m in source_notes if m])
+        return bundle, note
     except Exception as e:
         return None, f"Could not load saved model: {e}"
 
