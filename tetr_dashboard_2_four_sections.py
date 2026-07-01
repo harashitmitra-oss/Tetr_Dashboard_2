@@ -77,8 +77,100 @@ def _ml_model_file_prefix(program_filter: str = "") -> str:
     return "payment_model_all"
 
 
-def _ml_model_bundle_path(program_filter: str = "") -> Path:
+def _ml_model_bundle_path(program_filter: str = "", file_name: str = "") -> Path:
+    if file_name:
+        return ML_MODEL_DIR / Path(str(file_name)).name
     return ML_MODEL_DIR / f"{_ml_model_file_prefix(program_filter)}.joblib"
+
+
+def _ml_timestamp_slug(dt: datetime | None = None) -> str:
+    dt = dt or datetime.now()
+    return dt.strftime("%Y%m%d_%H%M%S")
+
+
+def _ml_human_time_from_slug(slug: str) -> str:
+    try:
+        return datetime.strptime(slug, "%Y%m%d_%H%M%S").strftime("%d %b %Y, %I:%M %p")
+    except Exception:
+        return clean_text(slug) if "clean_text" in globals() else str(slug)
+
+
+def _ml_versioned_model_file_name(program_filter: str = "", slug: str = "") -> str:
+    slug = clean_text(slug) if "clean_text" in globals() else str(slug or "")
+    slug = slug or _ml_timestamp_slug()
+    return f"{_ml_model_file_prefix(program_filter)}_{slug}.joblib"
+
+
+def _ml_extract_datetime_slug(file_name: str, prefix: str) -> str:
+    name = Path(str(file_name)).name
+    m = re.match(rf"^{re.escape(prefix)}_(\d{{8}}_\d{{6}})\.joblib$", name)
+    return m.group(1) if m else ""
+
+
+def _ml_file_label(file_name: str, prefix: str, kind: str = "Model") -> str:
+    name = Path(str(file_name)).name
+    latest_name = f"{prefix}.joblib"
+    if name == latest_name:
+        return f"Latest {kind} ({name})"
+    slug = _ml_extract_datetime_slug(name, prefix)
+    if slug:
+        return f"{kind} · {_ml_human_time_from_slug(slug)} ({name})"
+    return name
+
+
+def _ml_github_headers() -> dict:
+    cfg = _ml_get_github_model_config()
+    if not cfg:
+        return {}
+    return {
+        "Authorization": f"Bearer {cfg['token']}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "tetr-ml-prediction-dashboard",
+    }
+
+
+def _ml_list_github_directory(repo_dir: str) -> list[str]:
+    cfg = _ml_get_github_model_config()
+    if not cfg:
+        return []
+    owner, repo, branch = cfg["owner"], cfg["repo"], cfg["branch"]
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{str(repo_dir).strip('/')}?ref={branch}"
+    try:
+        req = urllib.request.Request(api_url, headers=_ml_github_headers(), method="GET")
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            items = json.loads(resp.read().decode("utf-8"))
+        if isinstance(items, dict):
+            items = [items]
+        return [clean_text(x.get("name", "")) for x in items if isinstance(x, dict) and clean_text(x.get("name", "")).endswith(".joblib")]
+    except Exception:
+        return []
+
+
+def _ml_list_saved_model_options(program_filter: str = "") -> list[dict]:
+    prefix = _ml_model_file_prefix(program_filter)
+    allowed = {f"{prefix}.joblib"}
+    version_re = re.compile(rf"^{re.escape(prefix)}_\d{{8}}_\d{{6}}\.joblib$")
+    names = set()
+    try:
+        if ML_MODEL_DIR.exists():
+            for path in ML_MODEL_DIR.glob(f"{prefix}*.joblib"):
+                if path.name in allowed or version_re.match(path.name):
+                    names.add(path.name)
+    except Exception:
+        pass
+    for name in _ml_list_github_directory("ml_saved_models"):
+        if name in allowed or version_re.match(name):
+            names.add(name)
+    if not names:
+        return []
+    def sort_key(name):
+        if name == f"{prefix}.joblib":
+            return (2, "99999999_999999")
+        slug = _ml_extract_datetime_slug(name, prefix)
+        return (1, slug) if slug else (0, name)
+    ordered = sorted(names, key=sort_key, reverse=True)
+    return [{"label": _ml_file_label(name, prefix, "Model"), "file_name": name} for name in ordered]
 
 
 def _ml_get_github_model_config():
@@ -194,52 +286,67 @@ def _ml_safe_display_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _ml_save_model_bundle(program_filter: str, bundle: dict) -> tuple[bool, str]:
+    """Save a model bundle as both a dated version and the latest alias.
+
+    The dated file gives you a selectable history in the dashboard. The latest
+    alias keeps the default load path fast and backward-compatible. Both are
+    pushed to GitHub when secrets are configured.
+    """
     try:
         if not bundle or bundle.get("model") is None:
             return False, "No trained model is available to save. Click Train / Re-train first."
         ML_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        now = datetime.now()
+        slug = _ml_timestamp_slug(now)
         payload = dict(bundle)
-        payload["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload["saved_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        payload["model_version_slug"] = slug
         payload["program_filter"] = clean_text(program_filter).upper() if program_filter else "ALL"
-        path = _ml_model_bundle_path(program_filter)
-        joblib.dump(payload, path)
+
+        versioned_path = _ml_model_bundle_path(program_filter, _ml_versioned_model_file_name(program_filter, slug))
+        latest_path = _ml_model_bundle_path(program_filter)
+        joblib.dump(payload, versioned_path, compress=3)
+        joblib.dump(payload, latest_path, compress=3)
+
         repo_root = Path(__file__).resolve().parent
-        try:
-            repo_path = path.relative_to(repo_root).as_posix()
-        except Exception:
-            repo_path = f"ml_saved_models/{path.name}"
+        paths_to_push = []
+        for path in [versioned_path, latest_path]:
+            try:
+                repo_path = path.relative_to(repo_root).as_posix()
+            except Exception:
+                repo_path = f"ml_saved_models/{path.name}"
+            paths_to_push.append((path, repo_path))
+
         cfg = _ml_get_github_model_config()
-        gh_ok, gh_msg = _ml_push_file_to_github(path, repo_path)
-        if gh_ok:
-            return True, f"Saved trained model bundle locally to {path} and pushed to GitHub. {gh_msg}"
+        gh_messages = []
+        gh_failures = []
+        for path, repo_path in paths_to_push:
+            gh_ok, gh_msg = _ml_push_file_to_github(path, repo_path)
+            if gh_ok:
+                gh_messages.append(gh_msg)
+            else:
+                gh_failures.append(gh_msg)
+
+        if cfg and gh_failures:
+            return False, f"Saved locally to {versioned_path} and {latest_path}, but GitHub upload failed. " + " | ".join(gh_failures)
         if cfg:
-            # GitHub was configured, so surface this as a real save failure instead of
-            # silently saying local-only. This makes token/repo/branch permission issues visible.
-            return False, f"Saved locally to {path}, but GitHub upload failed. {gh_msg}"
-        return True, f"Saved trained model bundle locally to {path}. {gh_msg}"
+            return True, f"Saved dated model ({versioned_path.name}) and latest model ({latest_path.name}) locally and pushed to GitHub."
+        return True, f"Saved dated model ({versioned_path.name}) and latest model ({latest_path.name}) locally. GitHub secrets are not configured."
     except Exception as e:
         return False, f"Could not save trained model: {e}"
 
 
-def _ml_pull_model_file_from_github(program_filter: str, local_path: Path) -> tuple[bool, str]:
-    """Download a saved model bundle from GitHub into the local app runtime.
-
-    This lets Streamlit Cloud reuse a model that was pushed to GitHub even before
-    the app redeploys with that file physically present in the checkout.
-    """
+def _ml_pull_model_file_from_github(program_filter: str, local_path: Path, file_name: str = "") -> tuple[bool, str]:
+    """Download a saved model bundle from GitHub into the local app runtime."""
     cfg = _ml_get_github_model_config()
     if not cfg:
         return False, "GitHub model download is not configured."
 
     owner, repo, branch, token = cfg["owner"], cfg["repo"], cfg["branch"], cfg["token"]
-    repo_path = f"ml_saved_models/{_ml_model_bundle_path(program_filter).name}"
+    wanted_name = Path(str(file_name)).name if file_name else _ml_model_bundle_path(program_filter).name
+    repo_path = f"ml_saved_models/{wanted_name}"
     api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{repo_path}?ref={branch}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "tetr-ml-prediction-dashboard",
-    }
+    headers = _ml_github_headers()
     try:
         req = urllib.request.Request(api_url, headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=45) as resp:
@@ -251,7 +358,6 @@ def _ml_pull_model_file_from_github(program_filter: str, local_path: Path) -> tu
         if content and encoding == "base64":
             raw_bytes = base64.b64decode(str(content).replace("\n", ""))
         else:
-            # For larger files GitHub may omit base64 content and provide a download URL.
             download_url = meta.get("download_url")
             if not download_url:
                 return False, f"GitHub model file was found but no downloadable content was returned for {repo_path}."
@@ -266,7 +372,7 @@ def _ml_pull_model_file_from_github(program_filter: str, local_path: Path) -> tu
         return True, f"Downloaded saved model from GitHub: {repo_path}"
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return False, f"No saved model found in GitHub at ml_saved_models/{_ml_model_bundle_path(program_filter).name}"
+            return False, f"No saved model found in GitHub at {repo_path}"
         try:
             detail = e.read().decode("utf-8")[:500]
         except Exception:
@@ -276,15 +382,13 @@ def _ml_pull_model_file_from_github(program_filter: str, local_path: Path) -> tu
         return False, f"GitHub model download failed: {e}"
 
 
-def _ml_load_model_bundle(program_filter: str) -> tuple[dict | None, str]:
+def _ml_load_model_bundle(program_filter: str, file_name: str = "") -> tuple[dict | None, str]:
     try:
-        path = _ml_model_bundle_path(program_filter)
+        path = _ml_model_bundle_path(program_filter, file_name)
         source_notes = []
 
-        # First use the model already present in the repo/runtime. This is the
-        # fastest path and should be the default after the .joblib has been saved.
         if not path.exists():
-            pulled, pull_msg = _ml_pull_model_file_from_github(program_filter, path)
+            pulled, pull_msg = _ml_pull_model_file_from_github(program_filter, path, file_name=file_name)
             source_notes.append(pull_msg)
             if not pulled and not path.exists():
                 return None, f"No saved model found at {path}. {pull_msg}"
@@ -292,9 +396,10 @@ def _ml_load_model_bundle(program_filter: str) -> tuple[dict | None, str]:
         bundle = joblib.load(path)
         if not isinstance(bundle, dict) or bundle.get("model") is None:
             return None, f"Saved model file exists but is not a valid model bundle: {path}"
-        note = f"Loaded saved model from {path}"
+        note = f"Loaded saved model from {path.name}"
         if source_notes:
             note += " · " + " · ".join([m for m in source_notes if m])
+        bundle["loaded_model_file"] = path.name
         return bundle, note
     except Exception as e:
         return None, f"Could not load saved model: {e}"
@@ -323,29 +428,63 @@ def _ml_model_bundle_summary(bundle: dict | None) -> str:
 ML_PREDICTION_DIR = Path(__file__).resolve().parent / "ml_saved_predictions"
 
 
-def _ml_prediction_bundle_path(program_filter: str = "") -> Path:
-    return ML_PREDICTION_DIR / f"payment_predictions_{_ml_model_file_prefix(program_filter).replace('payment_model_', '')}.joblib"
+def _ml_prediction_file_prefix(program_filter: str = "") -> str:
+    return f"payment_predictions_{_ml_model_file_prefix(program_filter).replace('payment_model_', '')}"
 
 
-def _ml_prediction_repo_path(program_filter: str = "") -> str:
-    return f"ml_saved_predictions/{_ml_prediction_bundle_path(program_filter).name}"
+def _ml_prediction_bundle_path(program_filter: str = "", file_name: str = "") -> Path:
+    if file_name:
+        return ML_PREDICTION_DIR / Path(str(file_name)).name
+    return ML_PREDICTION_DIR / f"{_ml_prediction_file_prefix(program_filter)}.joblib"
 
 
-def _ml_pull_prediction_file_from_github(program_filter: str, local_path: Path) -> tuple[bool, str]:
-    """Download the last saved prediction bundle from GitHub into runtime."""
+def _ml_prediction_repo_path(program_filter: str = "", file_name: str = "") -> str:
+    name = Path(str(file_name)).name if file_name else _ml_prediction_bundle_path(program_filter).name
+    return f"ml_saved_predictions/{name}"
+
+
+def _ml_versioned_prediction_file_name(program_filter: str = "", slug: str = "") -> str:
+    slug = clean_text(slug) if "clean_text" in globals() else str(slug or "")
+    slug = slug or _ml_timestamp_slug()
+    return f"{_ml_prediction_file_prefix(program_filter)}_{slug}.joblib"
+
+
+def _ml_list_saved_prediction_options(program_filter: str = "") -> list[dict]:
+    prefix = _ml_prediction_file_prefix(program_filter)
+    allowed = {f"{prefix}.joblib"}
+    version_re = re.compile(rf"^{re.escape(prefix)}_\d{{8}}_\d{{6}}\.joblib$")
+    names = set()
+    try:
+        if ML_PREDICTION_DIR.exists():
+            for path in ML_PREDICTION_DIR.glob(f"{prefix}*.joblib"):
+                if path.name in allowed or version_re.match(path.name):
+                    names.add(path.name)
+    except Exception:
+        pass
+    for name in _ml_list_github_directory("ml_saved_predictions"):
+        if name in allowed or version_re.match(name):
+            names.add(name)
+    if not names:
+        return []
+    def sort_key(name):
+        if name == f"{prefix}.joblib":
+            return (2, "99999999_999999")
+        slug = _ml_extract_datetime_slug(name, prefix)
+        return (1, slug) if slug else (0, name)
+    ordered = sorted(names, key=sort_key, reverse=True)
+    return [{"label": _ml_file_label(name, prefix, "Prediction"), "file_name": name} for name in ordered]
+
+
+def _ml_pull_prediction_file_from_github(program_filter: str, local_path: Path, file_name: str = "") -> tuple[bool, str]:
+    """Download a saved prediction bundle from GitHub into runtime."""
     cfg = _ml_get_github_model_config()
     if not cfg:
         return False, "GitHub prediction download is not configured."
 
     owner, repo, branch, token = cfg["owner"], cfg["repo"], cfg["branch"], cfg["token"]
-    repo_path = _ml_prediction_repo_path(program_filter)
+    repo_path = _ml_prediction_repo_path(program_filter, file_name=file_name)
     api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{repo_path}?ref={branch}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "tetr-ml-prediction-dashboard",
-    }
+    headers = _ml_github_headers()
     try:
         req = urllib.request.Request(api_url, headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=45) as resp:
@@ -381,50 +520,66 @@ def _ml_pull_prediction_file_from_github(program_filter: str, local_path: Path) 
         return False, f"GitHub prediction download failed: {e}"
 
 
-def _ml_load_prediction_bundle(program_filter: str) -> tuple[dict | None, str]:
-    """Load last saved prediction bundle from local/repo checkout or GitHub."""
+def _ml_load_prediction_bundle(program_filter: str, file_name: str = "") -> tuple[dict | None, str]:
+    """Load saved prediction bundle from local/repo checkout or GitHub."""
     try:
-        path = _ml_prediction_bundle_path(program_filter)
+        path = _ml_prediction_bundle_path(program_filter, file_name=file_name)
         source_notes = []
         if not path.exists():
-            pulled, pull_msg = _ml_pull_prediction_file_from_github(program_filter, path)
+            pulled, pull_msg = _ml_pull_prediction_file_from_github(program_filter, path, file_name=file_name)
             source_notes.append(pull_msg)
             if not pulled and not path.exists():
                 return None, f"No saved predictions found at {path}. {pull_msg}"
         bundle = joblib.load(path)
         if not isinstance(bundle, dict) or bundle.get("scored_df") is None:
             return None, f"Saved prediction file exists but is not a valid prediction bundle: {path}"
-        note = f"Loaded saved predictions from {path}"
+        note = f"Loaded saved predictions from {path.name}"
         if source_notes:
             note += " · " + " · ".join([m for m in source_notes if m])
+        bundle["loaded_prediction_file"] = path.name
         return bundle, note
     except Exception as e:
         return None, f"Could not load saved predictions: {e}"
 
 
 def _ml_save_prediction_bundle(program_filter: str, bundle: dict) -> tuple[bool, str]:
-    """Save the currently displayed/scored predictions locally and to GitHub."""
+    """Save the currently displayed/scored predictions as dated + latest bundles."""
     try:
         if not isinstance(bundle, dict) or bundle.get("scored_df") is None:
             return False, "No prediction data is available to save. Click Predict first, or load existing saved predictions."
         ML_PREDICTION_DIR.mkdir(parents=True, exist_ok=True)
+        now = datetime.now()
+        slug = _ml_timestamp_slug(now)
         payload = dict(bundle)
-        payload["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload["saved_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        payload["prediction_version_slug"] = slug
         payload["program_filter"] = clean_text(program_filter).upper() if program_filter else "ALL"
-        path = _ml_prediction_bundle_path(program_filter)
-        joblib.dump(payload, path, compress=3)
+
+        versioned_path = _ml_prediction_bundle_path(program_filter, _ml_versioned_prediction_file_name(program_filter, slug))
+        latest_path = _ml_prediction_bundle_path(program_filter)
+        joblib.dump(payload, versioned_path, compress=3)
+        joblib.dump(payload, latest_path, compress=3)
+
         repo_root = Path(__file__).resolve().parent
-        try:
-            repo_path = path.relative_to(repo_root).as_posix()
-        except Exception:
-            repo_path = _ml_prediction_repo_path(program_filter)
+        paths_to_push = []
+        for path in [versioned_path, latest_path]:
+            try:
+                repo_path = path.relative_to(repo_root).as_posix()
+            except Exception:
+                repo_path = _ml_prediction_repo_path(program_filter, path.name)
+            paths_to_push.append((path, repo_path))
+
         cfg = _ml_get_github_model_config()
-        gh_ok, gh_msg = _ml_push_file_to_github(path, repo_path)
-        if gh_ok:
-            return True, f"Saved prediction bundle locally to {path} and pushed to GitHub. {gh_msg}"
+        gh_failures = []
+        for path, repo_path in paths_to_push:
+            gh_ok, gh_msg = _ml_push_file_to_github(path, repo_path)
+            if not gh_ok:
+                gh_failures.append(gh_msg)
+        if cfg and gh_failures:
+            return False, f"Saved predictions locally to {versioned_path} and {latest_path}, but GitHub upload failed. " + " | ".join(gh_failures)
         if cfg:
-            return False, f"Saved predictions locally to {path}, but GitHub upload failed. {gh_msg}"
-        return True, f"Saved prediction bundle locally to {path}. {gh_msg}"
+            return True, f"Saved dated predictions ({versioned_path.name}) and latest predictions ({latest_path.name}) locally and pushed to GitHub."
+        return True, f"Saved dated predictions ({versioned_path.name}) and latest predictions ({latest_path.name}) locally. GitHub secrets are not configured."
     except Exception as e:
         return False, f"Could not save predictions: {e}"
 
@@ -12316,8 +12471,39 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
 
     existing_session_bundle = st.session_state.get(session_bundle_key)
     existing_prediction_session = st.session_state.get(prediction_bundle_key)
-    existing_saved_bundle, existing_saved_msg = _ml_load_model_bundle(target_program)
-    existing_prediction_bundle, existing_prediction_msg = _ml_load_prediction_bundle(target_program)
+
+    model_options = _ml_list_saved_model_options(target_program)
+    prediction_options = _ml_list_saved_prediction_options(target_program)
+    selected_model_file = ""
+    selected_prediction_file = ""
+    if model_options:
+        model_labels = [x["label"] for x in model_options]
+        selected_model_label = st.selectbox(
+            "Select trained model version",
+            model_labels,
+            index=0,
+            key=_ml_key("selected_model_version"),
+            help="Default is the latest saved model. Train only when you need to rebuild the model.",
+        )
+        selected_model_file = next((x["file_name"] for x in model_options if x["label"] == selected_model_label), model_options[0]["file_name"])
+    else:
+        st.caption("No saved trained model versions found yet for this page.")
+
+    if prediction_options:
+        pred_labels = [x["label"] for x in prediction_options]
+        selected_prediction_label = st.selectbox(
+            "Select saved prediction data",
+            pred_labels,
+            index=0,
+            key=_ml_key("selected_prediction_version"),
+            help="Default is the latest saved prediction output. Click Predict only when you need a fresh live score.",
+        )
+        selected_prediction_file = next((x["file_name"] for x in prediction_options if x["label"] == selected_prediction_label), prediction_options[0]["file_name"])
+    else:
+        st.caption("No saved prediction versions found yet for this page.")
+
+    existing_saved_bundle, existing_saved_msg = _ml_load_model_bundle(target_program, selected_model_file)
+    existing_prediction_bundle, existing_prediction_msg = _ml_load_prediction_bundle(target_program, selected_prediction_file)
 
     has_existing_model = (
         (isinstance(existing_session_bundle, dict) and existing_session_bundle.get("model") is not None)
@@ -12365,7 +12551,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
     if save_clicked:
         _update_ml_progress(5, "Saving existing trained model bundle. No prediction build or retraining will run on this click...")
         session_bundle = st.session_state.get(session_bundle_key)
-        saved_bundle, saved_msg = _ml_load_model_bundle(target_program)
+        saved_bundle, saved_msg = _ml_load_model_bundle(target_program, selected_model_file)
         bundle_to_save = session_bundle if isinstance(session_bundle, dict) and session_bundle.get("model") is not None else saved_bundle
         if not isinstance(bundle_to_save, dict) or bundle_to_save.get("model") is None:
             _update_ml_progress(100, "No trained or saved model bundle found to save.")
@@ -12386,7 +12572,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
     if save_predictions_clicked:
         _update_ml_progress(5, "Saving current prediction bundle. No prediction build or retraining will run on this click...")
         session_prediction = st.session_state.get(prediction_bundle_key)
-        saved_prediction, saved_pred_msg = _ml_load_prediction_bundle(target_program)
+        saved_prediction, saved_pred_msg = _ml_load_prediction_bundle(target_program, selected_prediction_file)
         bundle_to_save = session_prediction if isinstance(session_prediction, dict) and isinstance(session_prediction.get("scored_df"), pd.DataFrame) and not session_prediction.get("scored_df").empty else saved_prediction
         if not isinstance(bundle_to_save, dict) or not isinstance(bundle_to_save.get("scored_df"), pd.DataFrame) or bundle_to_save.get("scored_df").empty:
             _update_ml_progress(100, "No prediction bundle found to save.")
@@ -12419,7 +12605,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
 
     try:
         session_bundle = st.session_state.get(session_bundle_key)
-        saved_bundle, saved_msg = _ml_load_model_bundle(target_program)
+        saved_bundle, saved_msg = _ml_load_model_bundle(target_program, selected_model_file)
         active_bundle = session_bundle if isinstance(session_bundle, dict) and session_bundle.get("model") is not None else saved_bundle
 
         if train_clicked:
@@ -12448,12 +12634,8 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
                     "program_filter": target_program or "ALL",
                 }
                 st.session_state[session_bundle_key] = active_bundle
-                _update_ml_progress(95, "Training complete. Scoring current live features with the newly trained model...")
-                scored_df = score_ml_students(model, feature_df, threshold_mode=threshold_mode)
-                prediction_bundle = _ml_make_prediction_bundle(target_program, scored_df, feature_df, train_df, event_intel_df, group_intel_df, event_rows_df, perf_df, confusion_df, importance_df, error_audit_df, program_perf_df, threshold_mode, model=model)
-                active_prediction_bundle = prediction_bundle
-                st.session_state[prediction_bundle_key] = prediction_bundle
-                st.success("Model trained and current predictions generated in this session. Click **Save Current Trained Model** to save the model and **Save Predictions** to save the scored output.")
+                _update_ml_progress(100, "Training complete. No live prediction scoring was run. Click Save Current Trained Model to save this dated model, or Predict to score live students.")
+                st.success("Model trained in this session. Click **Save Current Trained Model** to save this trained model with date/time. Click **Predict** separately when you want to generate fresh live predictions.")
 
         elif predict_clicked:
             if not isinstance(active_bundle, dict) or active_bundle.get("model") is None:
@@ -12484,7 +12666,7 @@ def render_ml_predictions_page(data, program_filter: str = None, page_title: str
             # Default page open: do not build features and do not train. Display the
             # last saved prediction bundle only.
             session_prediction = st.session_state.get(prediction_bundle_key)
-            saved_prediction, saved_pred_msg = _ml_load_prediction_bundle(target_program)
+            saved_prediction, saved_pred_msg = _ml_load_prediction_bundle(target_program, selected_prediction_file)
             prediction_bundle = session_prediction if isinstance(session_prediction, dict) and isinstance(session_prediction.get("scored_df"), pd.DataFrame) and not session_prediction.get("scored_df").empty else saved_prediction
             if isinstance(prediction_bundle, dict) and isinstance(prediction_bundle.get("scored_df"), pd.DataFrame) and not prediction_bundle.get("scored_df").empty:
                 active_prediction_bundle = prediction_bundle
